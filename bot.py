@@ -82,7 +82,7 @@ while True:
             send_telegram(msg)
             last_candle = current_candle
 
-        time.sleep(60)
+        time.sleep(180)
 
     except Exception as e:
         print("Error:", e)
