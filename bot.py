@@ -16,8 +16,15 @@ def send_telegram(message):
     requests.post(url, data=payload)
 
 def fetch_gold():
-    df = yf.download("GC=F", interval="15m", period="2d")
+    df = yf.download("GC=F", interval="15m", period="5d", progress=False)
+    
+    # حل مشكلة pandas
+    if hasattr(df.columns, "levels"):
+        df.columns = df.columns.get_level_values(0)
+    
     return df
+    
+    
 
 def make_signal(df):
     close = df["Close"]
