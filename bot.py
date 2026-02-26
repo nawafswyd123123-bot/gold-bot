@@ -2,54 +2,71 @@ import os
 import time
 import math
 import requests
-import yfinance as yf
 import pandas as pd
+import yfinance as yf
 
-# =========================
-# CONFIG
-# =========================
-SYMBOL = "GC=F"
-INTERVAL = "15m"
-PERIOD = "5d"
-SLEEP_SECONDS = 180
-
-MAX_CONFIDENCE = 95.0
-MIN_BARS = 120
-
-# Alerts config
-FAKEOUT_N = 20
-ATR_LEN = 14
-ATR_FAST = 5
-ATR_SLOW = 20
-
-LIQUIDITY_SPIKE_MULT = 2.5
-VOL_SURGE_MULT = 1.8
-
-# Telegram env vars
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-if not BOT_TOKEN or not CHAT_ID:
-    raise RuntimeError("Missing env vars: BOT_TOKEN and/or CHAT_ID. Add them in Render Environment Variables.")
+SYMBOL = "GC=F"
+INTERVAL = "15m"
+PERIOD = "5d"          # كافي للحسابات
+SLEEP_SECONDS = 180    # كل 3 دقايق (خفيف على yfinance)
 
-TG_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+# منع التكرار
+last_candle_ts = None
+last_signal_sent = None
+last_alert_ts = None
 
 
-# =========================
-# TELEGRAM
-# =========================
-def send_telegram(text: str) -> None:
-    payload = {"chat_id": CHAT_ID, "text": text}
+def send_telegram(text: str):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Missing BOT_TOKEN or CHAT_ID in env vars")
+        return
+
+    if not text:
+        return
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text
+    }
     try:
-        requests.post(TG_URL, data=payload, timeout=15)
+        r = requests.post(url, data=payload, timeout=20)
+        if r.status_code != 200:
+            print("Telegram error:", r.status_code, r.text[:200])
     except Exception as e:
-        print("Telegram send error:", e)
+        print("Telegram request failed:", e)
 
 
-# =========================
-# INDICATORS
-# =========================
-def compute_rsi(series: pd.Series, length: int = 14) -> pd.Series:
+def fetch_gold():
+    df = yf.download(
+        SYMBOL,
+        interval=INTERVAL,
+        period=PERIOD,
+        progress=False,
+        auto_adjust=False,
+        threads=False
+    )
+
+    if df is None or df.empty:
+        return None
+
+    # إذا columns MultiIndex
+    if hasattr(df.columns, "levels"):
+        df.columns = df.columns.get_level_values(0)
+
+    # تأكد عندنا الأعمدة المطلوبة
+    needed = {"Open", "High", "Low", "Close"}
+    if not needed.issubset(set(df.columns)):
+        return None
+
+    df = df.dropna()
+    return df
+
+
+def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -57,223 +74,163 @@ def compute_rsi(series: pd.Series, length: int = 14) -> pd.Series:
     avg_gain = gain.rolling(length).mean()
     avg_loss = loss.rolling(length).mean()
 
-    rs = avg_gain / avg_loss.replace(0, math.nan)
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 
-def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     high = df["High"]
     low = df["Low"]
     close = df["Close"]
 
     prev_close = close.shift(1)
-    tr1 = (high - low).abs()
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
 
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.rolling(length).mean()
 
 
-# =========================
-# DATA FETCH
-# =========================
-def fetch_gold() -> pd.DataFrame:
-    df = yf.download(
-        SYMBOL,
-        interval=INTERVAL,
-        period=PERIOD,
-        auto_adjust=False,
-        progress=False
-    )
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    # Fix MultiIndex columns if any
-    if hasattr(df.columns, "levels"):
-        df.columns = df.columns.get_level_values(0)
-
-    needed = {"Open", "High", "Low", "Close"}
-    if not needed.issubset(set(df.columns)):
-        return pd.DataFrame()
-
-    return df.dropna().copy()
-
-
-# =========================
-# ALERTS (impact detection)
-# =========================
-def detect_alerts(df: pd.DataFrame) -> list[str]:
-    alerts: list[str] = []
-    if len(df) < max(MIN_BARS, ATR_SLOW + ATR_LEN + FAKEOUT_N + 5):
-        return alerts
-
-    last = df.iloc[-1]
-
-    # ATRs
-    atr14 = compute_atr(df, ATR_LEN)
-    atr_fast = compute_atr(df, ATR_FAST)
-    atr_slow = compute_atr(df, ATR_SLOW)
-
-    last_atr14 = float(atr14.iloc[-1]) if not pd.isna(atr14.iloc[-1]) else None
-    last_atr_fast = float(atr_fast.iloc[-1]) if not pd.isna(atr_fast.iloc[-1]) else None
-    last_atr_slow = float(atr_slow.iloc[-1]) if not pd.isna(atr_slow.iloc[-1]) else None
-
-    # Candle range
-    candle_range = float(last["High"] - last["Low"])
-
-    # 1) Liquidity Spike
-    if last_atr14 and candle_range > (LIQUIDITY_SPIKE_MULT * last_atr14):
-        alerts.append(f"Liquidity Spike (range {candle_range:.2f} > {LIQUIDITY_SPIKE_MULT}×ATR)")
-
-    # 2) Volatility Surge
-    if last_atr_fast and last_atr_slow and last_atr_fast > (VOL_SURGE_MULT * last_atr_slow):
-        alerts.append(f"Volatility Surge (ATR{ATR_FAST} > {VOL_SURGE_MULT}×ATR{ATR_SLOW})")
-
-    # 3) Fakeout detection
-    lookback_high = df["High"].iloc[-(FAKEOUT_N + 1):-1].max()
-    lookback_low = df["Low"].iloc[-(FAKEOUT_N + 1):-1].min()
-
-    last_close = float(last["Close"])
-    last_high = float(last["High"])
-    last_low = float(last["Low"])
-
-    if last_high > float(lookback_high) and last_close < float(lookback_high):
-        alerts.append(f"Fakeout UP (broke {lookback_high:.2f} then closed back below)")
-
-    if last_low < float(lookback_low) and last_close > float(lookback_low):
-        alerts.append(f"Fakeout DOWN (broke {lookback_low:.2f} then closed back above)")
-
-    # 4) News-like whipsaw candle (long wick vs body)
-    body = abs(float(last["Close"] - last["Open"]))
-    upper_wick = float(last["High"] - max(last["Close"], last["Open"]))
-    lower_wick = float(min(last["Close"], last["Open"]) - last["Low"])
-    wick = upper_wick + lower_wick
-
-    if body < 1e-9:
-        body = 1e-9
-
-    wick_ratio = wick / body
-
-    if last_atr14 and wick_ratio >= 3.0 and candle_range > (1.2 * last_atr14):
-        alerts.append("News-like Whipsaw (long wicks + big range)")
-
-    return alerts
-
-
-# =========================
-# SIGNAL + CONFIDENCE (Option B)
-# =========================
-def make_signal(df: pd.DataFrame) -> tuple[str | None, str | None, bool]:
-    """
-    Returns: (message_to_send, signal_name, has_alerts)
-    If message is None -> don't send anything
-    """
-    if df.empty or len(df) < MIN_BARS:
-        return None, None, False
-
+def compute_signal_and_confidence(df: pd.DataFrame):
     close = df["Close"]
+
     sma20 = close.rolling(20).mean()
     sma50 = close.rolling(50).mean()
-    rsi = compute_rsi(close, 14)
+    rsi14 = rsi(close, 14)
 
     last_price = float(close.iloc[-1])
-
-    if pd.isna(sma20.iloc[-1]) or pd.isna(sma50.iloc[-1]) or pd.isna(rsi.iloc[-1]):
-        return None, None, False
-
     last_sma20 = float(sma20.iloc[-1])
     last_sma50 = float(sma50.iloc[-1])
-    last_rsi = float(rsi.iloc[-1])
+    last_rsi = float(rsi14.iloc[-1])
 
-    # Decide signal (no WAIT)
+    # إشارة (بدون WAIT)
     if last_sma20 > last_sma50 and last_rsi > 50:
         signal = "BUY"
     elif last_sma20 < last_sma50 and last_rsi < 50:
         signal = "SELL"
     else:
-        return None, None, False
+        signal = None  # لا نرسل شيء
 
-    # Alerts
-    alerts = detect_alerts(df)
-    has_alerts = len(alerts) > 0
+    # Confidence تقريبية (0-95)
+    # قوة الترند = فرق SMA كنسبة من السعر
+    trend_strength = abs(last_sma20 - last_sma50) / max(last_price, 1e-9)
+    # قوة RSI = بعده عن 50
+    rsi_strength = abs(last_rsi - 50) / 50.0
 
-    # Confidence (heuristic)
-    trend_strength = abs(last_sma20 - last_sma50)
-    rsi_strength = abs(last_rsi - 50)
+    conf = 50 + (trend_strength * 2500) + (rsi_strength * 35)
+    conf = min(conf, 95)
+    conf = round(conf, 1)
 
-    atr14 = compute_atr(df, ATR_LEN)
-    last_atr14 = float(atr14.iloc[-1]) if not pd.isna(atr14.iloc[-1]) else None
-    scale = last_atr14 if last_atr14 and last_atr14 > 0 else (last_price * 0.001)
+    return signal, conf, last_price, round(last_sma20, 2), round(last_sma50, 2), round(last_rsi, 2)
 
-    trend_score = (trend_strength / scale) * 20.0
-    rsi_score = (rsi_strength / 50.0) * 30.0
 
-    confidence = 50.0 + trend_score + rsi_score
+def detect_volatility_alert(df: pd.DataFrame):
+    """
+    تنبيه شمعة قوية/سيولة:
+    - Range الشمعة الأخيرة > 1.8 * ATR
+    - أو جسم الشمعة كبير
+    """
+    if len(df) < 60:
+        return None
 
-    # Penalize a bit if alerts exist (still sending signal, but with caution)
-    if has_alerts:
-        confidence -= 10.0
+    a = atr(df, 14)
+    last_atr = float(a.iloc[-1]) if not math.isnan(a.iloc[-1]) else None
+    if not last_atr or last_atr <= 0:
+        return None
 
-    confidence = max(5.0, min(MAX_CONFIDENCE, round(confidence, 1)))
+    o = float(df["Open"].iloc[-1])
+    h = float(df["High"].iloc[-1])
+    l = float(df["Low"].iloc[-1])
+    c = float(df["Close"].iloc[-1])
 
-    # Build alert block (Option B)
-    alert_block = ""
-    if has_alerts:
-        alert_lines = "\n".join([f"⚠️ {a}" for a in alerts])
-        alert_block = (
-            f"⚠️ ALERTS (High impact conditions)\n"
-            f"{alert_lines}\n"
-            f"⚠️ Caution: volatility / possible fakeout.\n\n"
-        )
+    candle_range = h - l
+    body = abs(c - o)
 
-    msg = (
-        f"{alert_block}"
-        f"📊 GOLD SCALP (15m)\n\n"
-        f"💰 Price: {last_price:.2f}\n"
-        f"📈 SMA20: {last_sma20:.2f}\n"
-        f"📉 SMA50: {last_sma50:.2f}\n"
-        f"📊 RSI: {last_rsi:.2f}\n\n"
+    if candle_range > 1.8 * last_atr or body > 1.2 * last_atr:
+        strength = round((candle_range / last_atr), 2)
+        direction = "🟢 Bullish impulse" if c > o else "🔴 Bearish impulse"
+        return f"⚡ Volatility Spike ({INTERVAL})\n{direction}\nRange/ATR: {strength}x"
+
+    return None
+
+
+def detect_false_breakout(df: pd.DataFrame):
+    """
+    كسر كاذب بسيط:
+    - عمل High فوق أعلى 20 شمعة وبعدين أغلق تحتها (false break up)
+    - أو عمل Low تحت أدنى 20 شمعة وبعدين أغلق فوقها (false break down)
+    """
+    if len(df) < 40:
+        return None
+
+    lookback = 20
+    prev_high = float(df["High"].iloc[-(lookback+1):-1].max())
+    prev_low = float(df["Low"].iloc[-(lookback+1):-1].min())
+
+    last_high = float(df["High"].iloc[-1])
+    last_low = float(df["Low"].iloc[-1])
+    last_close = float(df["Close"].iloc[-1])
+
+    if last_high > prev_high and last_close < prev_high:
+        return f"🧨 False Break Up ({INTERVAL})\nBroke above {round(prev_high,2)} then closed back under."
+    if last_low < prev_low and last_close > prev_low:
+        return f"🧨 False Break Down ({INTERVAL})\nBroke below {round(prev_low,2)} then closed back above."
+    return None
+
+
+def format_signal_message(signal, conf, price, sma20, sma50, rsi14):
+    return (
+        f"📊 GOLD SCALP ({INTERVAL})\n\n"
+        f"💰 Price: {price}\n"
+        f"📈 SMA20: {sma20}\n"
+        f"📉 SMA50: {sma50}\n"
+        f"📊 RSI: {rsi14}\n\n"
         f"🚦 Signal: {signal}\n"
-        f"🔥 Confidence: {confidence}%\n"
+        f"🔥 Confidence: {conf}%"
     )
 
-    return msg, signal, has_alerts
 
-
-# =========================
-# LOOP (anti-spam)
-# =========================
-def main():
-    last_candle_ts = None
-    last_signal_sent = None
-    last_alert_state_sent = None  # True/False
+def main_loop():
+    global last_candle_ts, last_signal_sent, last_alert_ts
 
     while True:
         try:
             df = fetch_gold()
-            if df.empty:
-                print("No data, retry...")
-                time.sleep(SLEEP_SECONDS)
+            if df is None:
+                print("No data")
+                time.sleep(30)
                 continue
 
             current_ts = str(df.index[-1])
 
-            msg, signal, has_alerts = make_signal(df)
+            # حساب الإشارة
+            signal, conf, price, sma20, sma50, rsi14 = compute_signal_and_confidence(df)
 
-            if msg is not None:
-                # Send only when candle changes AND (signal changed OR alert state changed)
-                if current_ts != last_candle_ts:
-                    if (signal != last_signal_sent) or (has_alerts != last_alert_state_sent):
-                        send_telegram(msg)
-                        last_signal_sent = signal
-                        last_alert_state_sent = has_alerts
-                    last_candle_ts = current_ts
-            else:
-                # No signal -> just update candle timestamp when it changes
-                if current_ts != last_candle_ts:
-                    last_candle_ts = current_ts
+            # Alert events
+            vol_alert = detect_volatility_alert(df)
+            fb_alert = detect_false_breakout(df)
+
+            # نرسل Alerts مرة واحدة لكل شمعة (حتى ما يكرر)
+            # + نرسل signal فقط إذا تغيّر
+            if current_ts != last_candle_ts:
+                # شمعة جديدة
+                if signal and signal != last_signal_sent:
+                    send_telegram(format_signal_message(signal, conf, price, sma20, sma50, rsi14))
+                    last_signal_sent = signal
+
+                # Alerts (إذا موجودة)
+                alert_texts = []
+                if vol_alert:
+                    alert_texts.append(vol_alert)
+                if fb_alert:
+                    alert_texts.append(fb_alert)
+
+                if alert_texts:
+                    send_telegram("\n\n".join(alert_texts))
+
+                last_candle_ts = current_ts
 
             time.sleep(SLEEP_SECONDS)
 
@@ -283,4 +240,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main_loop()
