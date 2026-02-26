@@ -1,33 +1,7 @@
-import os
-import time
-import requests
-import yfinance as yf
-import pandas as pd
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message
-    }
-    requests.post(url, data=payload)
-
-def fetch_gold():
-    df = yf.download("GC=F", interval="15m", period="2d")
-
-    # حل مشكلة MultiIndex
-    if hasattr(df.columns, "levels"):
-        df.columns = df.columns.get_level_values(0)
-
-    return df
-
 def make_signal(df):
     close = df["Close"]
 
-    # تأكد انو Series مش DataFrame
+    # تأكد انه Series مش DataFrame
     if hasattr(close, "columns"):
         close = close.iloc[:, 0]
 
@@ -40,22 +14,31 @@ def make_signal(df):
 
     avg_gain = gain.rolling(14).mean()
     avg_loss = loss.rolling(14).mean()
-
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
 
-    price = round(close.iloc[-1], 2)
-    last_sma20 = round(sma20.iloc[-1], 2)
-    last_sma50 = round(sma50.iloc[-1], 2)
-    last_rsi = round(rsi.iloc[-1], 2)
+    price = round(float(close.iloc[-1]), 2)
+    last_sma20 = round(float(sma20.iloc[-1]), 2)
+    last_sma50 = round(float(sma50.iloc[-1]), 2)
+    last_rsi = round(float(rsi.iloc[-1]), 2)
 
+    # ====== Confidence (نسبة تقريبية - مش ضمان) ======
+    trend_strength = abs(last_sma20 - last_sma50)
+    rsi_strength = abs(last_rsi - 50)
+
+    confidence = 50 + (trend_strength * 2) + (rsi_strength * 0.8)
+    if confidence > 95:
+        confidence = 95
+    confidence = round(confidence, 1)
+
+    # ====== Signal ======
     if last_sma20 > last_sma50 and last_rsi > 50:
         signal = "BUY"
     elif last_sma20 < last_sma50 and last_rsi < 50:
         signal = "SELL"
     else:
-        return None
-        
+        return None  # ما تبعت WAIT نهائياً
+
     message = f"""
 📊 GOLD SCALP (15m)
 
@@ -65,12 +48,13 @@ def make_signal(df):
 📊 RSI: {last_rsi}
 
 🚦 Signal: {signal}
+🔥 Confidence: {confidence}%
 """
-
     return message
 
 
 last_candle = None
+last_signal = None
 
 while True:
     try:
@@ -79,7 +63,15 @@ while True:
 
         if current_candle != last_candle:
             msg = make_signal(df)
-            send_telegram(msg)
+
+            if msg is not None:
+                # استخرج الإشارة من النص لتجنب التكرار
+                current_signal = "BUY" if "Signal: BUY" in msg else "SELL"
+
+                if current_signal != last_signal:
+                    send_telegram(msg)
+                    last_signal = current_signal
+
             last_candle = current_candle
 
         time.sleep(180)
