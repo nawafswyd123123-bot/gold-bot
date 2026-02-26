@@ -54,8 +54,8 @@ def make_signal(df):
     elif last_sma20 < last_sma50 and last_rsi < 50:
         signal = "SELL"
     else:
-        signal = "WAIT"
-
+        return None
+        
     message = f"""
 📊 GOLD SCALP (15m)
 
