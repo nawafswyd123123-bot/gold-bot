@@ -16,14 +16,18 @@ def send_telegram(message):
     requests.post(url, data=payload)
 
 def fetch_gold():
-    df = yf.download("GC=F", interval="15m", period="1d")
+    df = yf.download("GC=F", interval="15m", period="2d")
+
+    # حل مشكلة MultiIndex
     if hasattr(df.columns, "levels"):
         df.columns = df.columns.get_level_values(0)
+
     return df
 
 def make_signal(df):
     close = df["Close"]
 
+    # تأكد انو Series مش DataFrame
     if hasattr(close, "columns"):
         close = close.iloc[:, 0]
 
@@ -53,17 +57,18 @@ def make_signal(df):
         signal = "WAIT"
 
     message = f"""
-GOLD SCALP (15m)
+📊 GOLD SCALP (15m)
 
-Price: {price}
-SMA20: {last_sma20}
-SMA50: {last_sma50}
-RSI: {last_rsi}
+💰 Price: {price}
+📈 SMA20: {last_sma20}
+📉 SMA50: {last_sma50}
+📊 RSI: {last_rsi}
 
-Signal: {signal}
+🚦 Signal: {signal}
 """
 
     return message
+
 
 last_candle = None
 
