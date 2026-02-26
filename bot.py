@@ -28,7 +28,9 @@ def fetch_gold():
 
 def make_signal(df):
     close = df["Close"]
-
+# تأكد أن Close مش DataFrame
+if hasattr(close, "columns"):
+    close = close.iloc[:, 0]
     sma20 = close.rolling(20).mean()
     sma50 = close.rolling(50).mean()
 
