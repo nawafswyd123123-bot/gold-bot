@@ -367,7 +367,7 @@ def main():
             else:
                 error_backoff = min(1800, max(180, error_backoff * 2) if error_backoff else 180)
 
-            time.sleep(max(180, SLEEP_SECONDS))
+            time.sleep(max(300, SLEEP_SECONDS))
 
 
 if __name__ == "__main__":
