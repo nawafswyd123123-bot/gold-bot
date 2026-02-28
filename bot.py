@@ -1,191 +1,252 @@
 import os
 import time
 import json
-from typing import Dict, Any, Tuple
+import math
+from datetime import datetime, timezone
 
 import requests
-import pandas as pd
-
 
 # =========================
-# CONFIG (تقدر تغيّرهم من Environment إذا بدك)
+# CONFIG (via ENV on Render)
 # =========================
-SYMBOL = os.getenv("SYMBOL", "XAU/USD")          # Gold spot
-INTERVAL = os.getenv("INTERVAL", "30min")        # 1min, 5min, 15min, 30min, 45min, 1h...
-OUTPUTSIZE = int(os.getenv("OUTPUTSIZE", "240")) # عدد الشموع
-CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "600"))   # كل قديش يفحص (ثواني)
-BACKOFF_SECONDS = int(os.getenv("BACKOFF_SECONDS", "120"))
-
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
+TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "").strip()
+SYMBOL = os.getenv("SYMBOL", "XAU/USD").strip()          # Examples: "XAU/USD" or "XAUUSD"
+INTERVAL = os.getenv("INTERVAL", "15min").strip()         # 1min, 5min, 15min, 1h, 4h, 1day ...
+ROWS = int(os.getenv("ROWS", "240"))                      # candles
+SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "600"))    # check every 10 minutes by default
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "").strip()
+# Strategy params
+FAST_EMA = int(os.getenv("FAST_EMA", "20"))
+SLOW_EMA = int(os.getenv("SLOW_EMA", "50"))
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+
+RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "70"))   # buy only if RSI <= 70
+RSI_SELL_MIN = float(os.getenv("RSI_SELL_MIN", "30")) # sell only if RSI >= 30
+
+# Local persistence (prevents duplicate alerts)
+LAST_SIGNAL_FILE = os.getenv("LAST_SIGNAL_FILE", "last_signal.json")
 
 
 # =========================
-# TELEGRAM
+# Helpers
 # =========================
-def send_telegram(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Telegram env vars missing (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).")
-        print("MSG:", text)
-        return
+def log(msg: str):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[{now}] {msg}", flush=True)
 
+
+def require_env():
+    missing = []
+    if not TWELVE_API_KEY:
+        missing.append("TWELVE_API_KEY")
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+
+    if missing:
+        raise RuntimeError(f"Missing ENV vars: {', '.join(missing)}")
+
+
+def read_last_signal():
+    try:
+        with open(LAST_SIGNAL_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("signal", ""), data.get("ts", "")
+    except Exception:
+        return "", ""
+
+
+def write_last_signal(signal: str):
+    try:
+        with open(LAST_SIGNAL_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                {"signal": signal, "ts": datetime.now(timezone.utc).isoformat()},
+                f,
+                ensure_ascii=False,
+            )
+    except Exception as e:
+        log(f"WARN: could not write last signal file: {e}")
+
+
+def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
-
-    try:
-        r = requests.post(url, json=payload, timeout=15)
-        if r.status_code != 200:
-            print("⚠️ Telegram send failed:", r.status_code, r.text[:300])
-    except Exception as e:
-        print("⚠️ Telegram exception:", e)
+    r = requests.post(url, json=payload, timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
 
 
 # =========================
-# STATE (anti-spam)
+# Indicators
 # =========================
-def load_state() -> Dict[str, Any]:
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        print("⚠️ state load error:", e)
-    return {}
+def ema(values, period):
+    """Exponential moving average"""
+    if len(values) < period:
+        return []
+    k = 2 / (period + 1)
+    out = [None] * len(values)
+    # seed with SMA
+    sma = sum(values[:period]) / period
+    out[period - 1] = sma
+    prev = sma
+    for i in range(period, len(values)):
+        prev = values[i] * k + prev * (1 - k)
+        out[i] = prev
+    return out
 
-def save_state(state: Dict[str, Any]) -> None:
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print("⚠️ state save error:", e)
 
+def rsi(values, period=14):
+    if len(values) < period + 1:
+        return []
+    out = [None] * len(values)
+    gains = []
+    losses = []
+    for i in range(1, period + 1):
+        change = values[i] - values[i - 1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    rs = (avg_gain / avg_loss) if avg_loss != 0 else math.inf
+    out[period] = 100 - (100 / (1 + rs))
 
-# =========================
-# DATA FETCH (TwelveData)
-# =========================
-def fetch_data() -> pd.DataFrame:
-    if not TWELVE_API_KEY:
-        print("❌ Missing TWELVE_API_KEY in environment variables")
-        return pd.DataFrame()
-
-    try:
-        url = "https://api.twelvedata.com/time_series"
-        params = {
-            "symbol": SYMBOL,
-            "interval": INTERVAL,
-            "outputsize": OUTPUTSIZE,
-            "apikey": TWELVE_API_KEY,
-            "format": "JSON"
-        }
-
-        r = requests.get(url, params=params, timeout=15)
-        data = r.json()
-
-        # إذا في خطأ بالمفتاح أو limit
-        if "status" in data and data["status"] == "error":
-            print("❌ TwelveData error:", data.get("message", data))
-            return pd.DataFrame()
-
-        values = data.get("values")
-        if not values:
-            print("❌ TwelveData empty values:", str(data)[:200])
-            return pd.DataFrame()
-
-        df = pd.DataFrame(values)
-
-        # TwelveData بيرجع strings
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df = df.set_index("datetime").sort_index()
-
-        df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
-        df = df[["Open", "High", "Low", "Close"]].astype(float)
-        df = df.dropna()
-
-        print(f"📥 TWELVE fetch rows={len(df)} last={df.index[-1]}")
-        return df
-
-    except Exception as e:
-        print("❌ Twelve fetch exception:", e)
-        return pd.DataFrame()
+    for i in range(period + 1, len(values)):
+        change = values[i] - values[i - 1]
+        gain = max(change, 0)
+        loss = max(-change, 0)
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        rs = (avg_gain / avg_loss) if avg_loss != 0 else math.inf
+        out[i] = 100 - (100 / (1 + rs))
+    return out
 
 
 # =========================
-# STRATEGY (EMA Cross)
+# Data fetch (Twelve Data)
 # =========================
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
+def fetch_candles():
+    """
+    Twelve Data time_series docs: returns list with datetime, open, high, low, close, volume
+    """
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": SYMBOL,
+        "interval": INTERVAL,
+        "outputsize": ROWS,
+        "apikey": TWELVE_API_KEY,
+        "format": "JSON",
+    }
+    r = requests.get(url, params=params, timeout=30)
+    data = r.json()
 
-def compute_signal(df: pd.DataFrame) -> Tuple[str, float, str]:
-    if len(df) < 60:
-        return "HOLD", float(df["Close"].iloc[-1]), "Not enough candles"
+    if "status" in data and data["status"] == "error":
+        raise RuntimeError(f"TwelveData error: {data.get('message')}")
 
-    close = df["Close"]
-    fast = ema(close, 12)
-    slow = ema(close, 26)
+    values = data.get("values", [])
+    if not values:
+        raise RuntimeError(f"No candles returned. Response: {data}")
 
-    # cross detection
-    if fast.iloc[-2] <= slow.iloc[-2] and fast.iloc[-1] > slow.iloc[-1]:
-        return "BUY", float(close.iloc[-1]), "EMA12 crossed above EMA26"
-    if fast.iloc[-2] >= slow.iloc[-2] and fast.iloc[-1] < slow.iloc[-1]:
-        return "SELL", float(close.iloc[-1]), "EMA12 crossed below EMA26"
+    # TwelveData returns newest first -> reverse to oldest first
+    values = list(reversed(values))
 
-    return "HOLD", float(close.iloc[-1]), "No cross"
-
-
-# =========================
-# MAIN LOOP
-# =========================
-def main() -> None:
-    state = load_state()
-    last_signal = state.get("last_signal", "NONE")
-    last_sent_at = float(state.get("last_sent_at", 0))
-
-    cooldown = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "1800"))  # 30 min
-
-    send_telegram("✅ Gold bot started (TwelveData).")
-
-    while True:
-        df = fetch_data()
-
-        if df.empty:
-            print("⚠️ df empty — backoff")
-            time.sleep(BACKOFF_SECONDS)
+    closes = []
+    times = []
+    for row in values:
+        try:
+            closes.append(float(row["close"]))
+            times.append(row["datetime"])
+        except Exception:
             continue
 
-        signal, price, reason = compute_signal(df)
-        now = time.time()
+    if len(closes) < max(SLOW_EMA, RSI_PERIOD) + 5:
+        raise RuntimeError(f"Not enough data: got {len(closes)} closes")
 
-        print(f"📊 signal={signal} price={price:.2f} reason={reason}")
+    return times, closes
 
-        # anti-spam:
-        # - only BUY/SELL
-        # - only if changed
-        # - cooldown
-        if signal in ("BUY", "SELL"):
-            changed = (signal != last_signal)
-            cooled = (now - last_sent_at) >= cooldown
 
-            if changed and cooled:
-                msg = (
-                    f"📌 Gold Signal ({SYMBOL})\n"
-                    f"Signal: {signal}\n"
-                    f"Price: {price:.2f}\n"
-                    f"TF: {INTERVAL}\n"
-                    f"Reason: {reason}"
-                )
-                send_telegram(msg)
+# =========================
+# Strategy
+# =========================
+def compute_signal(times, closes):
+    e_fast = ema(closes, FAST_EMA)
+    e_slow = ema(closes, SLOW_EMA)
+    r = rsi(closes, RSI_PERIOD)
 
-                last_signal = signal
-                last_sent_at = now
-                state["last_signal"] = last_signal
-                state["last_sent_at"] = last_sent_at
-                save_state(state)
+    i = len(closes) - 1
+    price = closes[i]
+    fast = e_fast[i]
+    slow = e_slow[i]
+    rsi_now = r[i]
 
-        time.sleep(CYCLE_SECONDS)
+    if fast is None or slow is None or rsi_now is None:
+        return "HOLD", price, "Indicators not ready"
+
+    # previous values for crossover detection
+    prev_i = i - 1
+    prev_fast = e_fast[prev_i]
+    prev_slow = e_slow[prev_i]
+    if prev_fast is None or prev_slow is None:
+        return "HOLD", price, "Prev indicators not ready"
+
+    # Bullish crossover: fast crosses above slow
+    if prev_fast <= prev_slow and fast > slow:
+        if rsi_now <= RSI_BUY_MAX:
+            return "BUY", price, f"EMA{FAST_EMA}>{SLOW_EMA} cross up | RSI={rsi_now:.1f}"
+        else:
+            return "HOLD", price, f"Cross up but RSI high ({rsi_now:.1f})"
+
+    # Bearish crossover: fast crosses below slow
+    if prev_fast >= prev_slow and fast < slow:
+        if rsi_now >= RSI_SELL_MIN:
+            return "SELL", price, f"EMA{FAST_EMA}<{SLOW_EMA} cross down | RSI={rsi_now:.1f}"
+        else:
+            return "HOLD", price, f"Cross down but RSI low ({rsi_now:.1f})"
+
+    return "HOLD", price, "No cross"
+
+
+def format_alert(signal, price, reason):
+    return (
+        f"🐋 GOLD SIGNAL: {signal}\n"
+        f"Symbol: {SYMBOL}\n"
+        f"TF: {INTERVAL}\n"
+        f"Price: {price:.2f}\n"
+        f"Reason: {reason}\n"
+        f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+
+
+# =========================
+# Main loop
+# =========================
+def main():
+    require_env()
+    log(f"Starting bot | symbol={SYMBOL} interval={INTERVAL} rows={ROWS} sleep={SLEEP_SECONDS}s")
+
+    while True:
+        try:
+            times, closes = fetch_candles()
+            signal, price, reason = compute_signal(times, closes)
+
+            log(f"signal={signal} price={price:.2f} reason={reason}")
+
+            if signal in ("BUY", "SELL"):
+                last_sig, last_ts = read_last_signal()
+                if last_sig != signal:
+                    send_telegram(format_alert(signal, price, reason))
+                    write_last_signal(signal)
+                    log(f"Telegram sent ✅ ({signal})")
+                else:
+                    log(f"Skip duplicate signal ({signal}) last_ts={last_ts}")
+
+        except Exception as e:
+            log(f"ERROR: {e}")
+
+        time.sleep(SLEEP_SECONDS)
 
 
 if __name__ == "__main__":
