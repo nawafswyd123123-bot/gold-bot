@@ -1,4 +1,5 @@
 import time
+import random
 import requests
 import yfinance as yf
 
@@ -7,8 +8,11 @@ CHAT_ID = "PUT_YOUR_CHAT_ID"
 
 SYMBOL = "GC=F"
 INTERVAL = "15m"
-PERIOD = "3d"
-SLEEP_SEC = 900  # 15 minutes
+PERIOD = "5d"
+
+CHECK_SEC = 15 * 60          # فحص كل 15 دقيقة
+RATE_LIMIT_WAIT = 60 * 60    # إذا انحظر: انتظر 60 دقيقة
+MAX_RETRIES = 2              # محاولات قليلة فقط (حتى ما يزيد الحظر)
 
 last_signal = None
 
@@ -22,23 +26,43 @@ def send(msg: str):
 
 
 def fetch_df():
-    try:
-        df = yf.download(SYMBOL, interval=INTERVAL, period=PERIOD, progress=False, threads=False)
-        if df is None or df.empty:
-            return None
-        return df
-    except Exception as e:
-        print("Yahoo error:", e)
-        return None
+    for attempt in range(MAX_RETRIES):
+        try:
+            df = yf.download(
+                SYMBOL,
+                interval=INTERVAL,
+                period=PERIOD,
+                progress=False,
+                threads=False
+            )
+            if df is not None and not df.empty:
+                return df
+
+            # إذا رجّع فاضي، نطر شوي
+            time.sleep(5)
+
+        except Exception as e:
+            err = str(e).lower()
+            print("Yahoo error:", e)
+
+            # ✅ إذا Rate Limit: وقف ساعة كاملة
+            if "rate limit" in err or "too many requests" in err:
+                print("Rate limited. Sleeping 60 minutes...")
+                send("⚠️ Yahoo Rate Limit — رح انطر 60 دقيقة وبكفّي لحالي.")
+                time.sleep(RATE_LIMIT_WAIT + random.randint(0, 120))
+                return None
+
+            # غير هيك: نطر شوي ونحاول مرة ثانية
+            time.sleep(10)
+
+    return None
 
 
 def get_signal():
     df = fetch_df()
     if df is None:
-        print("No market data")
         return None
 
-    # Indicators
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
@@ -48,10 +72,9 @@ def get_signal():
     rs = gain / loss
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # ✅ IMPORTANT: last value as FLOAT (not Series)
-    ema50 = float(df["EMA50"].iloc[-1])
-    ema200 = float(df["EMA200"].iloc[-1])
-    rsi = float(df["RSI"].iloc[-1])
+    ema50 = df["EMA50"].iloc[-1].item()
+    ema200 = df["EMA200"].iloc[-1].item()
+    rsi = df["RSI"].iloc[-1].item()
 
     if ema50 > ema200 and rsi < 30:
         return "BUY"
@@ -60,13 +83,19 @@ def get_signal():
     return None
 
 
-send("✅ Gold Bot started (M15)")
+send("✅ Gold Bot Started (M15) — Stable + Anti RateLimit")
 
 while True:
-    sig = get_signal()
+    try:
+        sig = get_signal()
 
-    if sig and sig != last_signal:
-        send(f"🔥 GOLD M15 SIGNAL: {sig}\nSymbol: {SYMBOL}")
-        last_signal = sig
+        if sig and sig != last_signal:
+            send(f"🔥 GOLD M15 SIGNAL: {sig}\nSymbol: {SYMBOL}")
+            last_signal = sig
 
-    time.sleep(SLEEP_SEC)
+        # ✅ مهم: نضيف ثواني عشوائية بسيطة حتى ما يصير نمط ثابت
+        time.sleep(CHECK_SEC + random.randint(5, 25))
+
+    except Exception as e:
+        print("Loop error:", e)
+        time.sleep(60)
