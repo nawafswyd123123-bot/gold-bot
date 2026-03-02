@@ -8,38 +8,33 @@ import yfinance as yf
 
 
 # =========================
-# ENV CONFIG
+# SETTINGS (ENV)
 # =========================
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# جرّب Spot أولاً، إذا فشل جرّب Futures
+INTERVAL = "15m"
+PERIOD = "60d"
+STATE_FILE = "state.json"
+
+# Tickers fallback
 TICKERS = ["XAUUSD=X", "GC=F"]
 
-INTERVAL = os.getenv("INTERVAL", "15m").strip()      # 15m
-PERIOD = os.getenv("PERIOD", "60d").strip()          # 60d كافي لـ EMA200
-LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "500"))
+# Strong signal parameters
+EMA_FAST = 20
+EMA_SLOW = 50
+EMA_TREND = 200
+RSI_PERIOD = 14
+RSI_BUY = 55
+RSI_SELL = 45
 
-EMA_FAST = int(os.getenv("EMA_FAST", "20"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
-EMA_TREND = int(os.getenv("EMA_TREND", "200"))
-
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-RSI_BUY = float(os.getenv("RSI_BUY", "55"))
-RSI_SELL = float(os.getenv("RSI_SELL", "45"))
-
-# إذا بدك يبعث كل 15 دقيقة حتى HOLD (للتأكد من التلغرام):
+# If true: send message every candle (even HOLD) to prove Telegram works
 SEND_HEARTBEAT = os.getenv("SEND_HEARTBEAT", "false").lower() in ("1", "true", "yes", "y")
 
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
-
 
 # =========================
-# UTIL
+# STATE
 # =========================
-def now_utc_iso():
-    return datetime.now(timezone.utc).isoformat()
-
 def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -47,7 +42,7 @@ def load_state():
     except Exception:
         return {}
 
-def save_state(state: dict):
+def save_state(state):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
@@ -64,11 +59,8 @@ def send_telegram(text: str) -> bool:
         return False
 
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True
-    }
+    payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
+
     try:
         r = requests.post(url, json=payload, timeout=20)
         if r.status_code != 200:
@@ -99,26 +91,16 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 # =========================
-# DATA FETCH (ROBUST)
+# DATA FETCH (VERY ROBUST)
 # =========================
-def normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
-    # حل مشكلة MultiIndex
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # If MultiIndex like ('Close','GC=F') -> keep first level
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # توحيد أسماء الأعمدة
-    df = df.rename(columns=str.title)
-
-    # بعض الأحيان يطلع "Adj Close" بدل "Close"
-    if "Close" not in df.columns and "Adj Close" in df.columns:
-        df["Close"] = df["Adj Close"]
-
-    required = {"Open", "High", "Low", "Close"}
-    if not required.issubset(set(df.columns)):
-        raise RuntimeError(f"Missing required columns: {list(df.columns)}")
-
-    df = df.dropna()
-    df.index = pd.to_datetime(df.index)
+    # Sometimes it is tuples even without pd.MultiIndex
+    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
     return df
 
 def fetch_data() -> tuple[str, pd.DataFrame]:
@@ -132,18 +114,31 @@ def fetch_data() -> tuple[str, pd.DataFrame]:
                 period=PERIOD,
                 progress=False,
                 auto_adjust=False,
-                threads=False
+                threads=False,
+                group_by="column",
             )
+
             if df is None or df.empty:
                 last_err = f"Empty data for {ticker}"
                 continue
 
-            df = normalize_yf_df(df)
-            df = df.tail(LOOKBACK_BARS)
+            df = _flatten_columns(df)
 
-            # تأكد في بيانات كفاية لـ EMA200
-            if len(df) < (EMA_TREND + 5):
-                last_err = f"Not enough bars for {ticker}: got {len(df)}"
+            # Map typical columns
+            if "Close" not in df.columns and "Adj Close" in df.columns:
+                df["Close"] = df["Adj Close"]
+
+            required = {"Open", "High", "Low", "Close"}
+            if not required.issubset(set(df.columns)):
+                last_err = f"Missing columns for {ticker}: {list(df.columns)}"
+                continue
+
+            df = df[["Open", "High", "Low", "Close"]].dropna()
+            df.index = pd.to_datetime(df.index)
+
+            # Need enough bars for EMA200
+            if len(df) < (EMA_TREND + 10):
+                last_err = f"Not enough bars for {ticker}: {len(df)}"
                 continue
 
             return ticker, df
@@ -156,30 +151,40 @@ def fetch_data() -> tuple[str, pd.DataFrame]:
 
 
 # =========================
-# STRONG SIGNAL LOGIC
+# STRONG SIGNAL
 # =========================
-def strong_signal(last_row, prev_row):
-    close = float(last_row["Close"])
-    ema_fast_now = float(last_row["EMA_FAST"])
-    ema_slow_now = float(last_row["EMA_SLOW"])
-    ema_trend_now = float(last_row["EMA_TREND"])
-    rsi_now = float(last_row["RSI"])
+def compute_signal(df: pd.DataFrame):
+    close = df["Close"].copy()
 
-    prev_fast = float(prev_row["EMA_FAST"])
-    prev_slow = float(prev_row["EMA_SLOW"])
+    df["EMA_FAST"] = ema(close, EMA_FAST)
+    df["EMA_SLOW"] = ema(close, EMA_SLOW)
+    df["EMA_TREND"] = ema(close, EMA_TREND)
+    df["RSI"] = rsi(close, RSI_PERIOD)
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    close_now = float(last["Close"])
+    ema_fast_now = float(last["EMA_FAST"])
+    ema_slow_now = float(last["EMA_SLOW"])
+    ema_trend_now = float(last["EMA_TREND"])
+    rsi_now = float(last["RSI"])
+
+    prev_fast = float(prev["EMA_FAST"])
+    prev_slow = float(prev["EMA_SLOW"])
 
     cross_up = (prev_fast <= prev_slow) and (ema_fast_now > ema_slow_now)
     cross_down = (prev_fast >= prev_slow) and (ema_fast_now < ema_slow_now)
 
-    # BUY قوي
-    if close > ema_trend_now and cross_up and rsi_now > RSI_BUY and close > ema_slow_now:
-        return "BUY", "Strong: >EMA200 + EMA20 cross up EMA50 + RSI>55 + close>EMA50"
+    # Strong BUY
+    if close_now > ema_trend_now and cross_up and rsi_now > RSI_BUY and close_now > ema_slow_now:
+        return "BUY", "Strong: >EMA200 + EMA20 cross up EMA50 + RSI>55 + close>EMA50", last
 
-    # SELL قوي
-    if close < ema_trend_now and cross_down and rsi_now < RSI_SELL and close < ema_slow_now:
-        return "SELL", "Strong: <EMA200 + EMA20 cross down EMA50 + RSI<45 + close<EMA50"
+    # Strong SELL
+    if close_now < ema_trend_now and cross_down and rsi_now < RSI_SELL and close_now < ema_slow_now:
+        return "SELL", "Strong: <EMA200 + EMA20 cross down EMA50 + RSI<45 + close<EMA50", last
 
-    return "HOLD", "Filtered: not strong"
+    return "HOLD", "Filtered: not strong", last
 
 
 # =========================
@@ -189,32 +194,21 @@ def main():
     state = load_state()
 
     ticker, df = fetch_data()
-
-    # indicators
-    close = df["Close"].copy()
-    df["EMA_FAST"] = ema(close, EMA_FAST)
-    df["EMA_SLOW"] = ema(close, EMA_SLOW)
-    df["EMA_TREND"] = ema(close, EMA_TREND)
-    df["RSI"] = rsi(close, RSI_PERIOD)
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    sig, reason, last = compute_signal(df)
 
     candle_time = df.index[-1]
-    candle_utc = candle_time
-    if candle_utc.tzinfo is None:
-        candle_utc = candle_utc.tz_localize(timezone.utc, ambiguous="NaT", nonexistent="NaT")
+    if candle_time.tzinfo is None:
+        candle_time = candle_time.tz_localize(timezone.utc, ambiguous="NaT", nonexistent="NaT")
     else:
-        candle_utc = candle_utc.astimezone(timezone.utc)
+        candle_time = candle_time.astimezone(timezone.utc)
 
-    candle_iso = candle_utc.isoformat()
-
-    sig, reason = strong_signal(last, prev)
+    candle_iso = candle_time.isoformat()
 
     price = float(last["Close"])
-    rsi_now = float(last["RSI"])
-    ema200 = float(last["EMA_TREND"])
-    ema50 = float(last["EMA_SLOW"])
+    # we may not always have indicators if data weird - but here we do
+    rsi_now = float(df["RSI"].iloc[-1])
+    ema200 = float(df["EMA_TREND"].iloc[-1])
+    ema50 = float(df["EMA_SLOW"].iloc[-1])
 
     msg = (
         f"XAU | 15m | {ticker}\n"
@@ -227,21 +221,18 @@ def main():
         f"reason: {reason}"
     )
 
-    # logs
+    # Logs
     print(msg.replace("\n", " | "))
 
-    # anti-duplicate
+    # Anti-duplicate per candle
     last_candle_sent = state.get("last_candle_time")
     last_signal_sent = state.get("last_signal")
 
     should_send = False
-
     if sig in ("BUY", "SELL"):
-        # ابعت إذا هاي شمعة جديدة أو إشارة جديدة
         if candle_iso != last_candle_sent or sig != last_signal_sent:
             should_send = True
     else:
-        # HOLD فقط إذا بدك Heartbeat
         if SEND_HEARTBEAT and candle_iso != last_candle_sent:
             should_send = True
 
@@ -250,8 +241,7 @@ def main():
         if ok:
             state["last_candle_time"] = candle_iso
             state["last_signal"] = sig
-            state["last_sent_at_utc"] = now_utc_iso()
-            state["last_ticker"] = ticker
+            state["last_sent_at_utc"] = datetime.now(timezone.utc).isoformat()
             save_state(state)
 
 
