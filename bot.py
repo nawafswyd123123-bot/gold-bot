@@ -1,31 +1,24 @@
 import os
 import json
-import time
 from datetime import datetime, timezone
 
 import requests
 import pandas as pd
-
-# يفضّل تثبيت yfinance
 import yfinance as yf
 
 
 # =========================
-# CONFIG (ENV VARS)
+# ENV CONFIG
 # =========================
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Yahoo tickers (جرّب بالترتيب)
-# XAUUSD=X عادة يعطي Spot Gold بالدولار
-# GC=F عقود ذهب (قد يختلف قليل)
-TICKERS = [
-    os.getenv("SYMBOL", "").strip() or "XAUUSD=X",
-    "GC=F",
-]
+# جرّب Spot أولاً، إذا فشل جرّب Futures
+TICKERS = ["XAUUSD=X", "GC=F"]
 
-INTERVAL = os.getenv("INTERVAL", "15m").strip()  # لازم 15m
-LOOKBACK = int(os.getenv("LOOKBACK_BARS", "400"))  # عدد شموع لجلب البيانات
+INTERVAL = os.getenv("INTERVAL", "15m").strip()      # 15m
+PERIOD = os.getenv("PERIOD", "60d").strip()          # 60d كافي لـ EMA200
+LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "500"))
 
 EMA_FAST = int(os.getenv("EMA_FAST", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
@@ -35,11 +28,56 @@ RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_BUY = float(os.getenv("RSI_BUY", "55"))
 RSI_SELL = float(os.getenv("RSI_SELL", "45"))
 
-# إذا بدك يبعث HOLD كل ربع ساعة فعّلها:
-SEND_HOLD = os.getenv("SEND_HOLD", "false").lower() in ("1", "true", "yes", "y")
+# إذا بدك يبعث كل 15 دقيقة حتى HOLD (للتأكد من التلغرام):
+SEND_HEARTBEAT = os.getenv("SEND_HEARTBEAT", "false").lower() in ("1", "true", "yes", "y")
 
-# منع التكرار: يبعت مرة واحدة لكل شمعة + لكل إشارة
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
+
+
+# =========================
+# UTIL
+# =========================
+def now_utc_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_state(state: dict):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("State save error:", str(e))
+
+
+# =========================
+# TELEGRAM
+# =========================
+def send_telegram(text: str) -> bool:
+    if not TOKEN or not CHAT_ID:
+        print("ERROR: Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+        return False
+
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=20)
+        if r.status_code != 200:
+            print("Telegram error:", r.status_code, r.text[:300])
+            return False
+        return True
+    except Exception as e:
+        print("Telegram exception:", str(e))
+        return False
 
 
 # =========================
@@ -61,103 +99,87 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 # =========================
-# SIGNAL LOGIC (STRONG)
+# DATA FETCH (ROBUST)
 # =========================
-def strong_signal(close, ema_fast, ema_slow, ema_trend, rsi_val, prev_ema_fast, prev_ema_slow):
-    cross_up = (prev_ema_fast <= prev_ema_slow) and (ema_fast > ema_slow)
-    cross_down = (prev_ema_fast >= prev_ema_slow) and (ema_fast < ema_slow)
+def normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
+    # حل مشكلة MultiIndex
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-    # BUY قوي
-    if close > ema_trend and cross_up and rsi_val > RSI_BUY and close > ema_slow:
-        return "BUY", "Strong: trend(>EMA200)+cross(20>50)+RSI>55+close>EMA50"
+    # توحيد أسماء الأعمدة
+    df = df.rename(columns=str.title)
 
-    # SELL قوي
-    if close < ema_trend and cross_down and rsi_val < RSI_SELL and close < ema_slow:
-        return "SELL", "Strong: trend(<EMA200)+cross(20<50)+RSI<45+close<EMA50"
+    # بعض الأحيان يطلع "Adj Close" بدل "Close"
+    if "Close" not in df.columns and "Adj Close" in df.columns:
+        df["Close"] = df["Adj Close"]
 
-    return "HOLD", "Filtered: not strong"
+    required = {"Open", "High", "Low", "Close"}
+    if not required.issubset(set(df.columns)):
+        raise RuntimeError(f"Missing required columns: {list(df.columns)}")
 
+    df = df.dropna()
+    df.index = pd.to_datetime(df.index)
+    return df
 
-# =========================
-# TELEGRAM
-# =========================
-def send_telegram(text: str):
-    if not TOKEN or not CHAT_ID:
-        print("ERROR: Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
-        return False
-
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=20)
-        ok = (r.status_code == 200)
-        if not ok:
-            print("Telegram error:", r.status_code, r.text[:300])
-        return ok
-    except Exception as e:
-        print("Telegram exception:", str(e))
-        return False
-
-
-# =========================
-# STATE (ANTI-DUPLICATE)
-# =========================
-def load_state():
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_state(state: dict):
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print("State save error:", str(e))
-
-
-# =========================
-# DATA FETCH
-# =========================
-def fetch_data():
+def fetch_data() -> tuple[str, pd.DataFrame]:
     last_err = None
-    for t in TICKERS:
-        if not t:
-            continue
+
+    for ticker in TICKERS:
         try:
             df = yf.download(
-                t,
+                ticker,
                 interval=INTERVAL,
-                period="60d",     # كفاية لـ EMA200 على 15m
+                period=PERIOD,
                 progress=False,
                 auto_adjust=False,
-                threads=False,
+                threads=False
             )
             if df is None or df.empty:
-                last_err = f"Empty data for {t}"
+                last_err = f"Empty data for {ticker}"
                 continue
 
-            # توحيد الأعمدة
-            df = df.rename(columns=str.title)
-            needed = {"Open", "High", "Low", "Close"}
-            if not needed.issubset(set(df.columns)):
-                last_err = f"Missing columns for {t}: {df.columns}"
+            df = normalize_yf_df(df)
+            df = df.tail(LOOKBACK_BARS)
+
+            # تأكد في بيانات كفاية لـ EMA200
+            if len(df) < (EMA_TREND + 5):
+                last_err = f"Not enough bars for {ticker}: got {len(df)}"
                 continue
 
-            df = df.dropna().tail(LOOKBACK)
-            df.index = pd.to_datetime(df.index)
+            return ticker, df
 
-            return t, df
         except Exception as e:
-            last_err = str(e)
+            last_err = f"{ticker}: {str(e)}"
             continue
 
     raise RuntimeError(f"Failed to fetch data. Last error: {last_err}")
+
+
+# =========================
+# STRONG SIGNAL LOGIC
+# =========================
+def strong_signal(last_row, prev_row):
+    close = float(last_row["Close"])
+    ema_fast_now = float(last_row["EMA_FAST"])
+    ema_slow_now = float(last_row["EMA_SLOW"])
+    ema_trend_now = float(last_row["EMA_TREND"])
+    rsi_now = float(last_row["RSI"])
+
+    prev_fast = float(prev_row["EMA_FAST"])
+    prev_slow = float(prev_row["EMA_SLOW"])
+
+    cross_up = (prev_fast <= prev_slow) and (ema_fast_now > ema_slow_now)
+    cross_down = (prev_fast >= prev_slow) and (ema_fast_now < ema_slow_now)
+
+    # BUY قوي
+    if close > ema_trend_now and cross_up and rsi_now > RSI_BUY and close > ema_slow_now:
+        return "BUY", "Strong: >EMA200 + EMA20 cross up EMA50 + RSI>55 + close>EMA50"
+
+    # SELL قوي
+    if close < ema_trend_now and cross_down and rsi_now < RSI_SELL and close < ema_slow_now:
+        return "SELL", "Strong: <EMA200 + EMA20 cross down EMA50 + RSI<45 + close<EMA50"
+
+    return "HOLD", "Filtered: not strong"
 
 
 # =========================
@@ -166,55 +188,37 @@ def fetch_data():
 def main():
     state = load_state()
 
-    symbol, df = fetch_data()
+    ticker, df = fetch_data()
 
+    # indicators
     close = df["Close"].copy()
     df["EMA_FAST"] = ema(close, EMA_FAST)
     df["EMA_SLOW"] = ema(close, EMA_SLOW)
     df["EMA_TREND"] = ema(close, EMA_TREND)
     df["RSI"] = rsi(close, RSI_PERIOD)
 
-    # نستخدم آخر شمعتين (آخر إغلاق + اللي قبلها)
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
     candle_time = df.index[-1]
-    # صيغة ثابتة
-    candle_time_iso = candle_time.tz_localize(timezone.utc, ambiguous="NaT", nonexistent="NaT").isoformat() \
-        if candle_time.tzinfo is None else candle_time.astimezone(timezone.utc).isoformat()
+    candle_utc = candle_time
+    if candle_utc.tzinfo is None:
+        candle_utc = candle_utc.tz_localize(timezone.utc, ambiguous="NaT", nonexistent="NaT")
+    else:
+        candle_utc = candle_utc.astimezone(timezone.utc)
 
-    sig, reason = strong_signal(
-        close=float(last["Close"]),
-        ema_fast=float(last["EMA_FAST"]),
-        ema_slow=float(last["EMA_SLOW"]),
-        ema_trend=float(last["EMA_TREND"]),
-        rsi_val=float(last["RSI"]),
-        prev_ema_fast=float(prev["EMA_FAST"]),
-        prev_ema_slow=float(prev["EMA_SLOW"]),
-    )
+    candle_iso = candle_utc.isoformat()
+
+    sig, reason = strong_signal(last, prev)
 
     price = float(last["Close"])
     rsi_now = float(last["RSI"])
     ema200 = float(last["EMA_TREND"])
     ema50 = float(last["EMA_SLOW"])
 
-    # منع التكرار: نفس الشمعة ونفس الإشارة -> لا تبعث
-    last_sent_candle = state.get("last_candle_time")
-    last_sent_signal = state.get("last_signal")
-
-    should_send = False
-    if sig in ("BUY", "SELL"):
-        if (candle_time_iso != last_sent_candle) or (sig != last_sent_signal):
-            should_send = True
-    else:
-        # HOLD فقط إذا المستخدم فعّل SEND_HOLD
-        if SEND_HOLD and (candle_time_iso != last_sent_candle):
-            should_send = True
-
-    # رسالة
     msg = (
-        f"XAU 15m | {symbol}\n"
-        f"time(UTC): {candle_time_iso}\n"
+        f"XAU | 15m | {ticker}\n"
+        f"time(UTC): {candle_iso}\n"
         f"signal: {sig}\n"
         f"price: {price:.2f}\n"
         f"RSI({RSI_PERIOD}): {rsi_now:.1f}\n"
@@ -223,15 +227,31 @@ def main():
         f"reason: {reason}"
     )
 
-    # طباعة للـ logs
+    # logs
     print(msg.replace("\n", " | "))
+
+    # anti-duplicate
+    last_candle_sent = state.get("last_candle_time")
+    last_signal_sent = state.get("last_signal")
+
+    should_send = False
+
+    if sig in ("BUY", "SELL"):
+        # ابعت إذا هاي شمعة جديدة أو إشارة جديدة
+        if candle_iso != last_candle_sent or sig != last_signal_sent:
+            should_send = True
+    else:
+        # HOLD فقط إذا بدك Heartbeat
+        if SEND_HEARTBEAT and candle_iso != last_candle_sent:
+            should_send = True
 
     if should_send:
         ok = send_telegram(msg)
         if ok:
-            state["last_candle_time"] = candle_time_iso
+            state["last_candle_time"] = candle_iso
             state["last_signal"] = sig
-            state["last_sent_at_utc"] = datetime.now(timezone.utc).isoformat()
+            state["last_sent_at_utc"] = now_utc_iso()
+            state["last_ticker"] = ticker
             save_state(state)
 
 
