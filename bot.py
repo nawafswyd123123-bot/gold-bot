@@ -3,7 +3,7 @@ import requests
 import yfinance as yf
 
 # ====== SETTINGS ======
-TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
+TOKEN = ""
 CHAT_ID = "PUT_YOUR_CHAT_ID_HERE"
 
 SYMBOL = "GC=F"        # Gold Futures on Yahoo (stable)
