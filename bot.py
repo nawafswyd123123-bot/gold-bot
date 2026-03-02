@@ -3,8 +3,8 @@ import requests
 import yfinance as yf
 import pandas as pd
 
-TOKEN = "حط_توكن_تلغرام_هون"
-CHAT_ID = "حط_ايدي_شاتك_هون"
+TOKEN ="8772073953:AAGpdi9Q3AykDDa4L0pOKHcgJlsXMkOKplE"
+CHAT_ID = "6150648369"
 
 last_signal = None
 
