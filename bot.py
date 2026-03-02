@@ -2,101 +2,56 @@ import time
 import requests
 import yfinance as yf
 
-# ====== SETTINGS ======
-TOKEN = ""
-CHAT_ID = "PUT_YOUR_CHAT_ID_HERE"
+TOKEN = "PUT_YOUR_TOKEN"
+CHAT_ID = "PUT_YOUR_CHAT_ID"
 
-SYMBOL = "GC=F"        # Gold Futures on Yahoo (stable)
-INTERVAL = "15m"       # 15 minutes timeframe
-PERIOD = "5d"          # More history helps indicators
-CHECK_EVERY_SEC = 15 * 60  # 15 minutes
+SYMBOL = "GC=F"   # Gold Futures (stable)
+INTERVAL = "15m"
+PERIOD = "5d"
 
 last_signal = None
-last_sent_at = 0
-COOLDOWN_SEC = 15 * 60  # prevent repeats within same candle
 
+def send(msg):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
-# ====== TELEGRAM ======
-def send_telegram(text: str) -> bool:
-    try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        r = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=20)
-        return r.status_code == 200
-    except Exception as e:
-        print("Telegram error:", e)
-        return False
-
-
-# ====== INDICATORS ======
-def ema(series, span: int):
-    return series.ewm(span=span, adjust=False).mean()
-
-def rsi(close, length: int = 14):
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-
-    avg_gain = gain.rolling(length).mean()
-    avg_loss = loss.rolling(length).mean()
-
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-# ====== SIGNAL LOGIC (STRONG) ======
 def get_signal():
     try:
         df = yf.download(SYMBOL, interval=INTERVAL, period=PERIOD, progress=False)
 
-        if df is None or df.empty:
-            print("No data received from Yahoo (market closed or Yahoo issue).")
-            return None, None
+        if df.empty:
+            print("No market data")
+            return None
 
-        # Indicators
-        df["EMA50"] = ema(df["Close"], 50)
-        df["EMA200"] = ema(df["Close"], 200)
-        df["RSI"] = rsi(df["Close"], 14)
+        df["EMA50"] = df["Close"].ewm(span=50).mean()
+        df["EMA200"] = df["Close"].ewm(span=200).mean()
+
+        delta = df["Close"].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss
+        df["RSI"] = 100 - (100 / (1 + rs))
 
         last = df.iloc[-1]
-        price = float(last["Close"])
-        ema50 = float(last["EMA50"])
-        ema200 = float(last["EMA200"])
-        r = float(last["RSI"])
 
-        # Strong filter: Trend + RSI extreme
-        if ema50 > ema200 and r <= 30:
-            return "BUY", price
-        if ema50 < ema200 and r >= 70:
-            return "SELL", price
-
-        return None, price
+        if last["EMA50"] > last["EMA200"] and last["RSI"] < 30:
+            return "BUY"
+        elif last["EMA50"] < last["EMA200"] and last["RSI"] > 70:
+            return "SELL"
+        else:
+            return None
 
     except Exception as e:
-        print("Data error:", e)
-        return None, None
+        print("Error:", e)
+        return None
 
+send("✅ Gold Bot Started")
 
-# ====== MAIN LOOP ======
-def main():
-    global last_signal, last_sent_at
+while True:
+    signal = get_signal()
 
-    send_telegram("✅ Gold Signal Bot started (M15)")
+    if signal and signal != last_signal:
+        send(f"🔥 GOLD M15 SIGNAL: {signal}")
+        last_signal = signal
 
-    while True:
-        signal, price = get_signal()
-
-        now = int(time.time())
-
-        # Send only when: signal exists AND changed AND cooldown passed
-        if signal and signal != last_signal and (now - last_sent_at) >= COOLDOWN_SEC:
-            msg = f"🔥 GOLD SIGNAL (M15)\nSignal: {signal}\nPrice: {price:.2f}\nSymbol: {SYMBOL}"
-            ok = send_telegram(msg)
-            if ok:
-                last_signal = signal
-                last_sent_at = now
-
-        time.sleep(CHECK_EVERY_SEC)
-
-
-if __name__ == "__main__":
-    main()
+    time.sleep(900)  # 15 minutes
