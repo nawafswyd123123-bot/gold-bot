@@ -243,7 +243,7 @@ def main():
             state["last_signal"] = sig
             state["last_sent_at_utc"] = datetime.now(timezone.utc).isoformat()
             save_state(state)
-
+send_telegram("TEST MESSAGE ✅")
 
 if __name__ == "__main__":
     main()
