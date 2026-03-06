@@ -101,8 +101,8 @@ def add_indicators(df: pd.DataFrame):
 def build_signal(df: pd.DataFrame):
     last = df.iloc[-1]
     prev = df.iloc[-2]
-buy = last["RSI"] < 35
-sell = last["RSI"] > 65
+buy = last["RSI"] < 45
+sell = last["RSI"] > 55
     
     
 
