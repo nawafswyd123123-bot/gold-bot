@@ -1,185 +1,219 @@
 import os
 import time
-import json
-import math
 import requests
-from datetime import datetime, timezone
+import pandas as pd
+import yfinance as yf
 
-# ====== Telegram settings (put in Render ENV vars) ======
-TG_TOKEN = os.getenv("TG_TOKEN", "")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+# =========================
+# إعدادات البوت
+# =========================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "PUT_YOUR_CHAT_ID_HERE")
 
-SYMBOL = os.getenv("SYMBOL", "XAUUSD=X")   # Yahoo symbol for XAUUSD spot
-INTERVAL = os.getenv("INTERVAL", "15m")    # 15m
-RANGE = os.getenv("RANGE", "5d")           # enough candles for EMAs
+SYMBOL = "XAUUSD=X"
+INTERVAL = "15m"
+PERIOD = "5d"
 
-FAST_EMA = int(os.getenv("FAST_EMA", "20"))
-SLOW_EMA = int(os.getenv("SLOW_EMA", "50"))
+CHECK_EVERY_SECONDS = 300   # كل 5 دقائق
+RSI_PERIOD = 14
+EMA_FAST = 9
+EMA_SLOW = 21
 
-SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "60"))  # check every minute; send only on new candle
-
-STATE_FILE = "state.json"
-
-
-def tg_send(message: str) -> bool:
-    if not TG_TOKEN or not TG_CHAT_ID:
-        print("Telegram env vars missing: TG_TOKEN / TG_CHAT_ID")
-        return False
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    r = requests.post(url, data={"chat_id": TG_CHAT_ID, "text": message}, timeout=20)
-    ok = (r.status_code == 200)
-    if not ok:
-        print("Telegram error:", r.status_code, r.text[:300])
-    return ok
+last_sent_candle = None
 
 
-def ema(values, period: int):
-    """Simple EMA. Returns list with same length; leading values may be None until enough data."""
-    if period <= 1:
-        return values[:]
-    k = 2 / (period + 1)
-    out = [None] * len(values)
-    ema_prev = None
-    for i, v in enumerate(values):
-        if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
-            out[i] = None
-            continue
-        if ema_prev is None:
-            # seed when we first have enough values
-            if i + 1 >= period:
-                window = [x for x in values[i + 1 - period:i + 1] if x is not None]
-                if len(window) == period:
-                    ema_prev = sum(window) / period
-                    out[i] = ema_prev
-                else:
-                    out[i] = None
-            else:
-                out[i] = None
-        else:
-            ema_prev = (v - ema_prev) * k + ema_prev
-            out[i] = ema_prev
-    return out
-
-
-def fetch_yahoo_candles(symbol: str, interval="15m", rng="5d"):
-    """
-    Fetch candles from Yahoo Finance chart endpoint.
-    Returns: timestamps (seconds), closes (float)
-    """
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"interval": interval, "range": rng, "includePrePost": "false"}
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    result = data.get("chart", {}).get("result", [])
-    if not result:
-        raise RuntimeError("No Yahoo chart result")
-
-    res = result[0]
-    ts = res.get("timestamp", [])
-    indicators = res.get("indicators", {}).get("quote", [])
-    if not indicators:
-        raise RuntimeError("No indicators in Yahoo response")
-    closes = indicators[0].get("close", [])
-    # filter out None
-    clean_ts = []
-    clean_cl = []
-    for t, c in zip(ts, closes):
-        if c is None:
-            continue
-        clean_ts.append(int(t))
-        clean_cl.append(float(c))
-    return clean_ts, clean_cl
-
-
-def load_state():
+# =========================
+# إرسال رسالة تلغرام
+# =========================
+def send_telegram(text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text
+    }
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"last_signal": None, "last_candle_ts": None}
+        r = requests.post(url, data=payload, timeout=20)
+        print("Telegram status:", r.status_code, r.text)
+    except Exception as e:
+        print("Telegram send error:", e)
 
 
-def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f)
+# =========================
+# جلب البيانات
+# =========================
+def get_data():
+    for attempt in range(4):
+        try:
+            df = yf.download(
+                tickers=SYMBOL,
+                interval=INTERVAL,
+                period=PERIOD,
+                progress=False,
+                auto_adjust=False,
+                threads=False
+            )
+
+            if df is None or df.empty:
+                print("No data received.")
+                return None
+
+            df = df.dropna().copy()
+
+            # إذا كانت الأعمدة MultiIndex
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            needed = ["Open", "High", "Low", "Close"]
+            for col in needed:
+                if col not in df.columns:
+                    print("Missing column:", col)
+                    return None
+
+            return df
+
+        except Exception as e:
+            print(f"Data fetch error (attempt {attempt+1}/4):", e)
+            time.sleep(15 * (attempt + 1))
+
+    return None
 
 
-def make_signal(ts_list, close_list):
-    """
-    Strategy: EMA(FAST) vs EMA(SLOW)
-    - BUY when fast > slow
-    - SELL when fast < slow
-    Return: (signal, last_candle_ts, last_price, fast, slow)
-    """
-    if len(close_list) < max(FAST_EMA, SLOW_EMA) + 5:
-        return None, None, None, None, None
+# =========================
+# حساب RSI
+# =========================
+def compute_rsi(series: pd.Series, period: int = 14):
+    delta = series.diff()
 
-    fast = ema(close_list, FAST_EMA)
-    slow = ema(close_list, SLOW_EMA)
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    # take last index where both exist
-    idx = None
-    for i in range(len(close_list) - 1, -1, -1):
-        if fast[i] is not None and slow[i] is not None:
-            idx = i
-            break
-    if idx is None:
-        return None, None, None, None, None
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
 
-    last_price = close_list[idx]
-    last_ts = ts_list[idx]
-
-    if fast[idx] > slow[idx]:
-        sig = "BUY"
-    elif fast[idx] < slow[idx]:
-        sig = "SELL"
-    else:
-        sig = None
-
-    return sig, last_ts, last_price, fast[idx], slow[idx]
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 
-def fmt_time(ts: int):
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-    return dt.strftime("%Y-%m-%d %H:%M UTC")
+# =========================
+# تجهيز المؤشرات
+# =========================
+def prepare_indicators(df: pd.DataFrame):
+    df = df.copy()
+
+    df["EMA_FAST"] = df["Close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["EMA_SLOW"] = df["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    df["RSI"] = compute_rsi(df["Close"], RSI_PERIOD)
+
+    return df
 
 
+# =========================
+# استخراج الإشارة
+# =========================
+def generate_signal(df: pd.DataFrame):
+    global last_sent_candle
+
+    if len(df) < 30:
+        print("Not enough candles yet.")
+        return None
+
+    # آخر شمعة مغلقة
+    last_closed = df.iloc[-2]
+    prev_closed = df.iloc[-3]
+    candle_time = str(df.index[-2])
+
+    # لا نكرر نفس الشمعة
+    if last_sent_candle == candle_time:
+        print("Signal already sent for this candle:", candle_time)
+        return None
+
+    buy_condition = (
+        last_closed["EMA_FAST"] > last_closed["EMA_SLOW"] and
+        prev_closed["EMA_FAST"] <= prev_closed["EMA_SLOW"] and
+        45 <= last_closed["RSI"] <= 70
+    )
+
+    sell_condition = (
+        last_closed["EMA_FAST"] < last_closed["EMA_SLOW"] and
+        prev_closed["EMA_FAST"] >= prev_closed["EMA_SLOW"] and
+        30 <= last_closed["RSI"] <= 55
+    )
+
+    entry = float(last_closed["Close"])
+
+    if buy_condition:
+        sl = round(entry - 7.0, 2)
+        tp = round(entry + 14.0, 2)
+        last_sent_candle = candle_time
+        return {
+            "type": "BUY",
+            "entry": round(entry, 2),
+            "sl": sl,
+            "tp": tp,
+            "time": candle_time,
+            "rsi": round(float(last_closed["RSI"]), 2)
+        }
+
+    if sell_condition:
+        sl = round(entry + 7.0, 2)
+        tp = round(entry - 14.0, 2)
+        last_sent_candle = candle_time
+        return {
+            "type": "SELL",
+            "entry": round(entry, 2),
+            "sl": sl,
+            "tp": tp,
+            "time": candle_time,
+            "rsi": round(float(last_closed["RSI"]), 2)
+        }
+
+    return None
+
+
+# =========================
+# تنسيق الرسالة
+# =========================
+def format_signal(signal: dict):
+    return (
+        f"XAUUSD {signal['type']} SIGNAL\n"
+        f"Time: {signal['time']}\n"
+        f"Entry: {signal['entry']}\n"
+        f"SL: {signal['sl']}\n"
+        f"TP: {signal['tp']}\n"
+        f"RSI: {signal['rsi']}\n"
+        f"TF: 15m"
+    )
+
+
+# =========================
+# تشغيل رئيسي
+# =========================
 def main():
-    state = load_state()
-    tg_send("✅ Bot started: XAUUSD signals (EMA crossover)")
+    send_telegram("Bot started successfully ✅")
 
     while True:
         try:
-            ts, cl = fetch_yahoo_candles(SYMBOL, INTERVAL, RANGE)
-            sig, candle_ts, price, f, s = make_signal(ts, cl)
+            print("Checking market data...")
 
-            if sig is None or candle_ts is None:
-                print("No signal yet / not enough data")
-                time.sleep(SLEEP_SECONDS)
-                continue
+            df = get_data()
+            if df is not None and not df.empty:
+                df = prepare_indicators(df)
+                signal = generate_signal(df)
 
-            # Only act on NEW candle timestamp
-            if state.get("last_candle_ts") != candle_ts:
-                # Send only if signal changed (BUY <-> SELL)
-                if state.get("last_signal") != sig:
-                    msg = (
-                        f"📌 XAUUSD SIGNAL: {sig}\n"
-                        f"Price: {price:.2f}\n"
-                        f"Time: {fmt_time(candle_ts)}\n"
-                        f"EMA{FAST_EMA}: {f:.2f} | EMA{SLOW_EMA}: {s:.2f}"
-                    )
-                    tg_send(msg)
-                    state["last_signal"] = sig
-
-                state["last_candle_ts"] = candle_ts
-                save_state(state)
-
-            time.sleep(SLEEP_SECONDS)
+                if signal:
+                    msg = format_signal(signal)
+                    print("Sending signal:", msg)
+                    send_telegram(msg)
+                else:
+                    print("No valid signal.")
+            else:
+                print("No data available.")
 
         except Exception as e:
-            print("Error:", repr(e))
-            time.sleep(300)
+            print("Main loop error:", e)
+
+        time.sleep(CHECK_EVERY_SECONDS)
 
 
 if __name__ == "__main__":
