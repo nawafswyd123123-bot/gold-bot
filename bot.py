@@ -101,18 +101,10 @@ def add_indicators(df: pd.DataFrame):
 def build_signal(df: pd.DataFrame):
     last = df.iloc[-1]
     prev = df.iloc[-2]
-
-    buy = (
-        last["Close"] > last["EMA20"] > last["EMA50"]
-        and prev["Close"] <= prev["EMA20"]
-        and last["RSI"] > 52
-    )
-
-    sell = (
-        last["Close"] < last["EMA20"] < last["EMA50"]
-        and prev["Close"] >= prev["EMA20"]
-        and last["RSI"] < 48
-    )
+buy = last["RSI"] < 35
+sell = last["RSI"] > 65
+    
+    
 
     if buy:
         return "BUY"
