@@ -179,7 +179,7 @@ def main():
 
         except Exception as e:
             print("Error:", repr(e))
-            time.sleep(900)
+            time.sleep(300)
 
 
 if __name__ == "__main__":
