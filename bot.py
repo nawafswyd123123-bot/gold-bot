@@ -94,18 +94,15 @@ def add_indicators(df: pd.DataFrame):
     rs = avg_gain / avg_loss.replace(0, pd.NA)
     df["RSI"] = 100 - (100 / (1 + rs))
     df["RSI"] = df["RSI"].fillna(50)
-
+    
     return df
-
-
 def build_signal(df: pd.DataFrame):
     last = df.iloc[-1]
     prev = df.iloc[-2]
-buy = last["RSI"] < 45
-sell = last["RSI"] > 55
-    
-    
 
+    buy = last["RSI"] < 45
+    sell = last["RSI"] > 55
+    
     if buy:
         return "BUY"
     if sell:
