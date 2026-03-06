@@ -16,6 +16,7 @@ INTERVAL = "15m"
 CHECK_EVERY_SECONDS = 900
 
 LAST_SIGNAL = None
+LAST_SENT_CANDLE = None
 
 
 def send_telegram_message(message: str) -> None:
@@ -107,7 +108,7 @@ def build_signal(df: pd.DataFrame):
 
 
 def main():
-    global LAST_SIGNAL
+    global LAST_SIGNAL, LAST_SENT_CANDLE
 
     try:
         df, used_symbol = download_gold_data()
@@ -115,15 +116,17 @@ def main():
 
         signal = build_signal(df)
         last = df.iloc[-1]
+        candle_time = str(df.index[-1])
 
-        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
         price = float(last["Close"])
         ema20 = float(last["EMA20"])
         ema50 = float(last["EMA50"])
         rsi = float(last["RSI"])
 
-        if signal and signal != LAST_SIGNAL:
+        if signal and (signal != LAST_SIGNAL or candle_time != LAST_SENT_CANDLE):
             LAST_SIGNAL = signal
+            LAST_SENT_CANDLE = candle_time
 
             message = (
                 f"🔥 GOLD SIGNAL (15m)\n"
@@ -149,4 +152,5 @@ if __name__ == "__main__":
     print("Gold Signal Bot started...")
     while True:
         main()
+        print(f"Sleeping for {CHECK_EVERY_SECONDS} seconds")
         time.sleep(CHECK_EVERY_SECONDS)
