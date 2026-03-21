@@ -8,8 +8,8 @@ from datetime import datetime
 # =========================
 # TELEGRAM SETTINGS
 # =========================
-TELEGRAM_BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
-TELEGRAM_CHAT_ID = "PUT_YOUR_CHAT_ID_HERE"
+TELEGRAM_BOT_TOKEN = "8772073953:AAGpdi9Q3AykDDa4L0pOKHcgJlsXMkOKplE"
+TELEGRAM_CHAT_ID = "6150648369"
 
 # =========================
 # MARKET SETTINGS
