@@ -1,378 +1,357 @@
-import os
 import time
-import traceback
-from datetime import datetime, timezone
-
+import math
+import requests
 import pandas as pd
 import yfinance as yf
-import requests
-
+from datetime import datetime
 
 # =========================
-# الإعدادات
+# TELEGRAM SETTINGS
 # =========================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
+TELEGRAM_CHAT_ID = "PUT_YOUR_CHAT_ID_HERE"
 
-SYMBOL = os.getenv("SYMBOL", "GC=F").strip()          # Gold Futures
-INTERVAL = os.getenv("INTERVAL", "15m").strip()       # 15m
-PERIOD = os.getenv("PERIOD", "5d").strip()            # enough candles for indicators
-CHECK_SECONDS = int(os.getenv("CHECK_SECONDS", "60")) # check every 60 sec
+# =========================
+# MARKET SETTINGS
+# =========================
+SYMBOL = "GC=F"           # Gold Futures on Yahoo
+ENTRY_INTERVAL = "15m"
+HTF_INTERVAL = "60m"
 
+ENTRY_PERIOD = "7d"
+HTF_PERIOD = "30d"
+
+CHECK_EVERY_SECONDS = 60
+
+# =========================
+# STRATEGY SETTINGS
+# =========================
 EMA_FAST = 20
 EMA_SLOW = 50
-RSI_LEN = 14
-ATR_LEN = 14
-VOL_MA_LEN = 20
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+VOL_MA_PERIOD = 20
 
-MIN_RSI_BUY = 55
-MAX_RSI_SELL = 45
+MIN_ATR = 0.80            # ignore weak candles
+VOLUME_MULTIPLIER = 1.10  # current volume must be > avg volume * this
+RR_TP1 = 1.2
+RR_TP2 = 2.0
 
-# لمنع تكرار نفس الإشارة
-LAST_SIGNAL_FILE = "last_signal.txt"
+last_sent_candle_time = None
 
 
 # =========================
-# أدوات مساعدة
+# TELEGRAM
 # =========================
-def log(message: str) -> None:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {message}", flush=True)
-
-
-def send_telegram(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram variables missing.")
-        return
-
+def send_telegram_message(text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "HTML"
+        "parse_mode": "Markdown"
     }
-
-    response = requests.post(url, data=payload, timeout=20)
-    if response.status_code != 200:
-        raise Exception(f"Telegram error {response.status_code}: {response.text}")
-
-
-def safe_numeric_series(df: pd.DataFrame, col_name: str) -> pd.Series:
-    if col_name not in df.columns:
-        raise ValueError(f"Column {col_name} not found. Available columns: {list(df.columns)}")
-
-    series = df[col_name]
-
-    # لو رجع عمود بشكل DataFrame أو MultiIndex نعالجه
-    if isinstance(series, pd.DataFrame):
-        if series.shape[1] == 0:
-            raise ValueError(f"Column {col_name} is empty DataFrame.")
-        series = series.iloc[:, 0]
-
-    return pd.to_numeric(series, errors="coerce")
+    try:
+        response = requests.post(url, data=payload, timeout=20)
+        response.raise_for_status()
+        print("Telegram message sent.")
+    except Exception as e:
+        print("Telegram error:", e)
 
 
-def calculate_rsi(close: pd.Series, length: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+# =========================
+# INDICATORS
+# =========================
+def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
 
-    avg_gain = gain.ewm(alpha=1 / length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / length, adjust=False).mean()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
 
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
+    return rsi
 
 
-def calculate_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    high = safe_numeric_series(df, "High")
-    low = safe_numeric_series(df, "Low")
-    close = safe_numeric_series(df, "Close")
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high_low = df["High"] - df["Low"]
+    high_close = (df["High"] - df["Close"].shift()).abs()
+    low_close = (df["Low"] - df["Close"].shift()).abs()
 
-    prev_close = close.shift(1)
-
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1 / length, adjust=False).mean()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     return atr
 
 
-def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # إذا yfinance رجع MultiIndex
-    if isinstance(df.columns, pd.MultiIndex):
-        new_cols = []
-        for col in df.columns:
-            if isinstance(col, tuple):
-                new_cols.append(col[0])
-            else:
-                new_cols.append(col)
-        df.columns = new_cols
-    return df
-
-
-def get_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
+# =========================
+# DATA LOADER
+# =========================
+def download_data(symbol: str, interval: str, period: str) -> pd.DataFrame:
     df = yf.download(
         tickers=symbol,
-        period=period,
         interval=interval,
+        period=period,
         auto_adjust=False,
-        progress=False,
-        threads=False
+        progress=False
     )
 
     if df is None or df.empty:
-        raise ValueError("No data returned from Yahoo Finance.")
+        raise ValueError(f"No data for {symbol} {interval}")
 
-    df = flatten_columns(df).copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [col[0] for col in df.columns]
 
     needed = ["Open", "High", "Low", "Close", "Volume"]
-    missing = [c for c in needed if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns: {missing}. Found: {list(df.columns)}")
-
-    # نحتفظ فقط بالأعمدة المطلوبة
-    df = df[needed].copy()
-
     for col in needed:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if col not in df.columns:
+            raise ValueError(f"Missing column: {col}")
 
-    df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
-
-    if len(df) < 60:
-        raise ValueError(f"Not enough candles: {len(df)}")
-
+    df = df.dropna().copy()
     return df
 
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    close = safe_numeric_series(df, "Close")
-    volume = safe_numeric_series(df, "Volume")
+def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
 
-    # هنا أصلحنا الخطأ: Close وليس [['Close']]
-    df["EMA20"] = close.ewm(span=EMA_FAST, adjust=False).mean()
-    df["EMA50"] = close.ewm(span=EMA_SLOW, adjust=False).mean()
-    df["RSI"] = calculate_rsi(close, RSI_LEN)
-    df["ATR"] = calculate_atr(df, ATR_LEN)
-    df["VOL_MA"] = volume.rolling(VOL_MA_LEN).mean()
+    df["EMA20"] = df["Close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["EMA50"] = df["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    df["RSI"] = calculate_rsi(df["Close"], RSI_PERIOD)
+    df["ATR"] = calculate_atr(df, ATR_PERIOD)
+    df["VOL_MA"] = df["Volume"].rolling(VOL_MA_PERIOD).mean()
 
-    return df
+    return df.dropna().copy()
 
 
-def get_higher_trend(symbol: str) -> str:
-    df_1h = get_data(symbol, period="10d", interval="1h")
-    df_1h = add_indicators(df_1h)
-
-    last = df_1h.iloc[-1]
-    if pd.isna(last["EMA20"]) or pd.isna(last["EMA50"]):
-        return "NEUTRAL"
-
-    if last["EMA20"] > last["EMA50"]:
-        return "UP"
-    if last["EMA20"] < last["EMA50"]:
-        return "DOWN"
-    return "NEUTRAL"
+# =========================
+# HELPERS
+# =========================
+def get_entry_data() -> pd.DataFrame:
+    df = download_data(SYMBOL, ENTRY_INTERVAL, ENTRY_PERIOD)
+    return prepare_indicators(df)
 
 
-def signal_strength(row: pd.Series, trend_1h: str) -> int:
-    score = 0
-
-    if row["EMA20"] > row["EMA50"]:
-        score += 25
-    if row["Close"] > row["EMA20"]:
-        score += 20
-    if row["RSI"] >= MIN_RSI_BUY:
-        score += 15
-    if row["Volume"] > row["VOL_MA"]:
-        score += 15
-    if trend_1h == "UP":
-        score += 25
-
-    return min(score, 100)
+def get_htf_data() -> pd.DataFrame:
+    df = download_data(SYMBOL, HTF_INTERVAL, HTF_PERIOD)
+    return prepare_indicators(df)
 
 
-def signal_strength_sell(row: pd.Series, trend_1h: str) -> int:
-    score = 0
-
-    if row["EMA20"] < row["EMA50"]:
-        score += 25
-    if row["Close"] < row["EMA20"]:
-        score += 20
-    if row["RSI"] <= MAX_RSI_SELL:
-        score += 15
-    if row["Volume"] > row["VOL_MA"]:
-        score += 15
-    if trend_1h == "DOWN":
-        score += 25
-
-    return min(score, 100)
+def is_new_closed_candle(candle_time, last_time) -> bool:
+    if last_time is None:
+        return True
+    return str(candle_time) != str(last_time)
 
 
-def build_signal(df: pd.DataFrame, trend_1h: str):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+def format_signal(signal: dict) -> str:
+    return (
+        f"🔥 *GOLD SIGNAL ({ENTRY_INTERVAL})*\n"
+        f"*Type:* {signal['type']}\n"
+        f"*Price:* {signal['price']:.2f}\n"
+        f"*EMA20:* {signal['ema20']:.2f}\n"
+        f"*EMA50:* {signal['ema50']:.2f}\n"
+        f"*RSI:* {signal['rsi']:.2f}\n"
+        f"*ATR:* {signal['atr']:.2f}\n"
+        f"*Volume Ratio:* {signal['volume_ratio']:.2f}x\n"
+        f"*1H Trend:* {signal['htf_trend']}\n"
+        f"*SL:* {signal['sl']:.2f}\n"
+        f"*TP1:* {signal['tp1']:.2f}\n"
+        f"*TP2:* {signal['tp2']:.2f}\n"
+        f"*Reason:* {signal['reason']}\n"
+        f"*Time:* {signal['time']}\n"
+        f"*Source:* {SYMBOL}"
+    )
 
-    # حماية من NaN
-    required = ["Close", "EMA20", "EMA50", "RSI", "ATR", "Volume", "VOL_MA"]
-    for col in required:
-        if pd.isna(last[col]):
+
+# =========================
+# STRATEGY
+# =========================
+def detect_signal(entry_df: pd.DataFrame, htf_df: pd.DataFrame):
+    if len(entry_df) < 60 or len(htf_df) < 60:
+        return None
+
+    # Last fully closed candle on 15m
+    c1 = entry_df.iloc[-1]
+    c2 = entry_df.iloc[-2]
+    c3 = entry_df.iloc[-3]
+    c4 = entry_df.iloc[-4]
+    c5 = entry_df.iloc[-5]
+
+    # Higher timeframe last closed candle
+    h1 = htf_df.iloc[-1]
+
+    close_1 = float(c1["Close"])
+    open_1 = float(c1["Open"])
+    high_1 = float(c1["High"])
+    low_1 = float(c1["Low"])
+
+    close_2 = float(c2["Close"])
+    high_2 = float(c2["High"])
+    low_2 = float(c2["Low"])
+
+    ema20 = float(c1["EMA20"])
+    ema50 = float(c1["EMA50"])
+    rsi = float(c1["RSI"])
+    atr = float(c1["ATR"])
+
+    vol_now = float(c1["Volume"])
+    vol_avg = float(c1["VOL_MA"]) if not math.isnan(float(c1["VOL_MA"])) else 0.0
+    volume_ratio = vol_now / vol_avg if vol_avg > 0 else 0.0
+
+    htf_ema20 = float(h1["EMA20"])
+    htf_ema50 = float(h1["EMA50"])
+    htf_close = float(h1["Close"])
+
+    htf_up = htf_ema20 > htf_ema50 and htf_close > htf_ema20
+    htf_down = htf_ema20 < htf_ema50 and htf_close < htf_ema20
+
+    recent_high = max(float(c2["High"]), float(c3["High"]), float(c4["High"]), float(c5["High"]))
+    recent_low = min(float(c2["Low"]), float(c3["Low"]), float(c4["Low"]), float(c5["Low"]))
+
+    bullish_body = close_1 > open_1
+    bearish_body = close_1 < open_1
+
+    strong_volume = volume_ratio >= VOLUME_MULTIPLIER
+    strong_atr = atr >= MIN_ATR
+
+    trend_up = ema20 > ema50 and close_1 > ema20
+    trend_down = ema20 < ema50 and close_1 < ema20
+
+    # BUY:
+    # 1) 15m trend up
+    # 2) 1H trend up
+    # 3) previous candle made fake breakdown below recent low or dipped under EMA20
+    # 4) current candle closes back strong above EMA20 and previous high
+    buy_condition = (
+        trend_up
+        and htf_up
+        and strong_volume
+        and strong_atr
+        and (
+            low_2 < recent_low
+            or low_2 < float(c2["EMA20"])
+        )
+        and close_1 > ema20
+        and close_1 > high_2
+        and bullish_body
+        and rsi > 52
+    )
+
+    # SELL:
+    # 1) 15m trend down
+    # 2) 1H trend down
+    # 3) previous candle made fake breakout above recent high or spiked above EMA20
+    # 4) current candle closes back strong below EMA20 and previous low
+    sell_condition = (
+        trend_down
+        and htf_down
+        and strong_volume
+        and strong_atr
+        and (
+            high_2 > recent_high
+            or high_2 > float(c2["EMA20"])
+        )
+        and close_1 < ema20
+        and close_1 < low_2
+        and bearish_body
+        and rsi < 48
+    )
+
+    candle_time = c1.name
+
+    if buy_condition:
+        sl = min(low_1, low_2) - (atr * 0.20)
+        risk = close_1 - sl
+        if risk <= 0:
             return None
 
-    buy_cross = prev["EMA20"] <= prev["EMA50"] and last["EMA20"] > last["EMA50"]
-    sell_cross = prev["EMA20"] >= prev["EMA50"] and last["EMA20"] < last["EMA50"]
-
-    buy_ok = (
-        last["EMA20"] > last["EMA50"]
-        and last["Close"] > last["EMA20"]
-        and last["RSI"] >= MIN_RSI_BUY
-        and trend_1h == "UP"
-        and last["Volume"] >= last["VOL_MA"]
-    )
-
-    sell_ok = (
-        last["EMA20"] < last["EMA50"]
-        and last["Close"] < last["EMA20"]
-        and last["RSI"] <= MAX_RSI_SELL
-        and trend_1h == "DOWN"
-        and last["Volume"] >= last["VOL_MA"]
-    )
-
-    price = float(last["Close"])
-    atr = float(last["ATR"])
-
-    if buy_ok:
-        strength = signal_strength(last, trend_1h)
-        sl = price - (1.2 * atr)
-        tp1 = price + (1.8 * atr)
-        tp2 = price + (3.0 * atr)
+        tp1 = close_1 + (risk * RR_TP1)
+        tp2 = close_1 + (risk * RR_TP2)
 
         return {
             "type": "BUY",
-            "price": price,
-            "ema20": float(last["EMA20"]),
-            "ema50": float(last["EMA50"]),
-            "rsi": float(last["RSI"]),
+            "price": close_1,
+            "ema20": ema20,
+            "ema50": ema50,
+            "rsi": rsi,
             "atr": atr,
-            "strength": strength,
+            "volume_ratio": volume_ratio,
+            "htf_trend": "UP",
             "sl": sl,
             "tp1": tp1,
             "tp2": tp2,
-            "reason": "EMA20 > EMA50, price above EMA20, RSI supportive, volume confirmed, 1H trend UP",
-            "cross": buy_cross,
+            "reason": "15m uptrend + 1H uptrend + fake breakdown recovery + strong volume",
+            "time": str(candle_time)
         }
 
-    if sell_ok:
-        strength = signal_strength_sell(last, trend_1h)
-        sl = price + (1.2 * atr)
-        tp1 = price - (1.8 * atr)
-        tp2 = price - (3.0 * atr)
+    if sell_condition:
+        sl = max(high_1, high_2) + (atr * 0.20)
+        risk = sl - close_1
+        if risk <= 0:
+            return None
+
+        tp1 = close_1 - (risk * RR_TP1)
+        tp2 = close_1 - (risk * RR_TP2)
 
         return {
             "type": "SELL",
-            "price": price,
-            "ema20": float(last["EMA20"]),
-            "ema50": float(last["EMA50"]),
-            "rsi": float(last["RSI"]),
+            "price": close_1,
+            "ema20": ema20,
+            "ema50": ema50,
+            "rsi": rsi,
             "atr": atr,
-            "strength": strength,
+            "volume_ratio": volume_ratio,
+            "htf_trend": "DOWN",
             "sl": sl,
             "tp1": tp1,
             "tp2": tp2,
-            "reason": "EMA20 < EMA50, price below EMA20, RSI supportive, volume confirmed, 1H trend DOWN",
-            "cross": sell_cross,
+            "reason": "15m downtrend + 1H downtrend + fake breakout failure + strong volume",
+            "time": str(candle_time)
         }
 
     return None
 
 
-def format_signal_message(signal: dict) -> str:
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+# =========================
+# MAIN LOOP
+# =========================
+def main():
+    global last_sent_candle_time
 
-    cross_text = "Yes" if signal.get("cross") else "No"
+    print("✅ Gold signal bot is running.")
+    print(f"Entry TF: {ENTRY_INTERVAL}")
+    print(f"HTF Filter: {HTF_INTERVAL}")
+    print("Filters: EMA20/50 + RSI + ATR + Volume + 1H trend + Fake Breakout")
 
-    return (
-        f"🔥 <b>GOLD SIGNAL ({INTERVAL})</b>\n"
-        f"Type: <b>{signal['type']}</b>\n"
-        f"Price: {signal['price']:.2f}\n"
-        f"EMA20: {signal['ema20']:.2f}\n"
-        f"EMA50: {signal['ema50']:.2f}\n"
-        f"RSI: {signal['rsi']:.2f}\n"
-        f"ATR: {signal['atr']:.2f}\n"
-        f"Strength: {signal['strength']}%\n"
-        f"EMA Cross Now: {cross_text}\n"
-        f"SL: {signal['sl']:.2f}\n"
-        f"TP1: {signal['tp1']:.2f}\n"
-        f"TP2: {signal['tp2']:.2f}\n"
-        f"Reason: {signal['reason']}\n"
-        f"Time: {now_utc}\n"
-        f"Source: {SYMBOL}"
+    send_telegram_message(
+        "✅ Gold signal bot is running.\n"
+        f"Entry TF: {ENTRY_INTERVAL}\n"
+        f"HTF Filter: {HTF_INTERVAL}\n"
+        "Filters: EMA20/50 + RSI + ATR + Volume + 1H trend + Fake Breakout"
     )
-
-
-def load_last_signal_key() -> str:
-    if not os.path.exists(LAST_SIGNAL_FILE):
-        return ""
-    try:
-        with open(LAST_SIGNAL_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception:
-        return ""
-
-
-def save_last_signal_key(key: str) -> None:
-    with open(LAST_SIGNAL_FILE, "w", encoding="utf-8") as f:
-        f.write(key)
-
-
-def make_signal_key(signal: dict) -> str:
-    # مفتاح بسيط لمنع تكرار نفس الإشارة
-    return f"{signal['type']}_{round(signal['price'], 2)}_{round(signal['ema20'], 2)}_{round(signal['ema50'], 2)}"
-
-
-def run_bot() -> None:
-    log("Bot started successfully.")
-
-    # رسالة تشغيل أول مرة
-    try:
-        send_telegram(
-            f"✅ Gold signal bot is running.\n"
-            f"Timeframe: {INTERVAL}\n"
-            f"Filters: EMA20/50 + RSI + ATR + Volume + 1H trend"
-        )
-    except Exception as e:
-        log(f"Startup telegram error: {e}")
 
     while True:
         try:
-            df = get_data(SYMBOL, PERIOD, INTERVAL)
-            df = add_indicators(df)
+            entry_df = get_entry_data()
+            htf_df = get_htf_data()
 
-            trend_1h = get_higher_trend(SYMBOL)
-            signal = build_signal(df, trend_1h)
+            last_candle_time = entry_df.iloc[-1].name
 
-            if signal:
-                signal_key = make_signal_key(signal)
-                last_key = load_last_signal_key()
+            signal = detect_signal(entry_df, htf_df)
 
-                if signal_key != last_key:
-                    message = format_signal_message(signal)
-                    send_telegram(message)
-                    save_last_signal_key(signal_key)
-                    log(f"Signal sent: {signal['type']} at {signal['price']:.2f}")
-                else:
-                    log("Same signal already sent before. Skipping.")
+            if signal and is_new_closed_candle(last_candle_time, last_sent_candle_time):
+                msg = format_signal(signal)
+                print(msg)
+                send_telegram_message(msg)
+                last_sent_candle_time = last_candle_time
             else:
-                log("No valid signal right now.")
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] No new signal.")
 
         except Exception as e:
-            log(f"Main loop error: {e}")
-            log(traceback.format_exc())
+            print("Bot error:", e)
 
-        time.sleep(CHECK_SECONDS)
+        time.sleep(CHECK_EVERY_SECONDS)
 
 
 if __name__ == "__main__":
-    run_bot()
+    main()
