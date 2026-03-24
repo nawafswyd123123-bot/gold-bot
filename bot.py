@@ -8,20 +8,21 @@ from datetime import datetime
 # =========================
 # TELEGRAM SETTINGS
 # =========================
-TELEGRAM_BOT_TOKEN = "8772073953:AAGpdi9Q3AykDDa4L0pOKHcgJlsXMkOKplE"
+TELEGRAM_BOT_TOKEN = "8772073953:AAEJyq-Tx09me6fdjdiU59r79CIVxKY4WgM"
 TELEGRAM_CHAT_ID = "6150648369"
 
 # =========================
 # MARKET SETTINGS
 # =========================
-SYMBOL = "GC=F"            # Gold Futures
+SYMBOL = "GC=F"
 ENTRY_INTERVAL = "15m"
 HTF_INTERVAL = "60m"
 
 ENTRY_PERIOD = "10d"
 HTF_PERIOD = "45d"
 
-CHECK_EVERY_SECONDS = 60
+# مهم: خفف عدد الطلبات حتى ما يعمل Rate Limit
+CHECK_EVERY_SECONDS = 300   # كل 5 دقائق
 
 # =========================
 # STRATEGY SETTINGS
@@ -42,7 +43,6 @@ RR_TP1 = 1.2
 RR_TP2 = 2.0
 
 COOLDOWN_CANDLES = 4
-LOOKBACK_SWING = 6
 
 last_sent_candle_time = None
 last_signal_type = None
@@ -110,28 +110,39 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
-    plus_di = 100 * (plus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr.replace(0, 1e-10))
-    minus_di = 100 * (minus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr.replace(0, 1e-10))
+    plus_di = 100 * (
+        plus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        / atr.replace(0, 1e-10)
+    )
+    minus_di = 100 * (
+        minus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        / atr.replace(0, 1e-10)
+    )
 
     dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-10)) * 100
     adx = dx.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     return adx
 
-
 # =========================
 # DATA LOADER
 # =========================
-def download_data(symbol: str, interval: str, period: str) -> pd.DataFrame:
-    df = yf.download(
-        tickers=symbol,
-        interval=interval,
-        period=period,
-        auto_adjust=False,
-        progress=False
-    )
+def download_data(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
+    try:
+        df = yf.download(
+            tickers=symbol,
+            interval=interval,
+            period=period,
+            auto_adjust=False,
+            progress=False,
+            threads=False
+        )
+    except Exception as e:
+        print("Download error:", e)
+        return None
 
     if df is None or df.empty:
-        raise ValueError(f"No data for {symbol} {interval}")
+        print(f"No data for {symbol} {interval}")
+        return None
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [col[0] for col in df.columns]
@@ -139,13 +150,20 @@ def download_data(symbol: str, interval: str, period: str) -> pd.DataFrame:
     needed = ["Open", "High", "Low", "Close", "Volume"]
     for col in needed:
         if col not in df.columns:
-            raise ValueError(f"Missing column: {col}")
+            print(f"Missing column: {col}")
+            return None
 
     df = df.dropna().copy()
+    if df.empty:
+        return None
+
     return df
 
 
-def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame | None:
+    if df is None or df.empty:
+        return None
+
     df = df.copy()
 
     df["EMA20"] = df["Close"].ewm(span=EMA_FAST, adjust=False).mean()
@@ -154,22 +172,25 @@ def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ATR"] = calculate_atr(df, ATR_PERIOD)
     df["VOL_MA"] = df["Volume"].rolling(VOL_MA_PERIOD).mean()
     df["ADX"] = calculate_adx(df, ADX_PERIOD)
-
     df["BODY"] = (df["Close"] - df["Open"]).abs()
     df["RANGE"] = df["High"] - df["Low"]
 
-    return df.dropna().copy()
+    df = df.dropna().copy()
+    if df.empty:
+        return None
+
+    return df
 
 
 # =========================
 # HELPERS
 # =========================
-def get_entry_data() -> pd.DataFrame:
+def get_entry_data() -> pd.DataFrame | None:
     df = download_data(SYMBOL, ENTRY_INTERVAL, ENTRY_PERIOD)
     return prepare_indicators(df)
 
 
-def get_htf_data() -> pd.DataFrame:
+def get_htf_data() -> pd.DataFrame | None:
     df = download_data(SYMBOL, HTF_INTERVAL, HTF_PERIOD)
     return prepare_indicators(df)
 
@@ -208,23 +229,25 @@ def format_signal(signal: dict) -> str:
         f"*Source:* {SYMBOL}"
     )
 
-
 # =========================
 # STRATEGY
 # =========================
 def detect_signal(entry_df: pd.DataFrame, htf_df: pd.DataFrame):
+    if entry_df is None or htf_df is None:
+        return None
+
     if len(entry_df) < 80 or len(htf_df) < 80:
         return None
 
-    # Use ONLY fully closed candles
-    c1 = entry_df.iloc[-2]  # latest closed candle
+    # latest closed candles only
+    c1 = entry_df.iloc[-2]
     c2 = entry_df.iloc[-3]
     c3 = entry_df.iloc[-4]
     c4 = entry_df.iloc[-5]
     c5 = entry_df.iloc[-6]
     c6 = entry_df.iloc[-7]
 
-    h1 = htf_df.iloc[-2]    # latest closed 1H candle
+    h1 = htf_df.iloc[-2]
     h2 = htf_df.iloc[-3]
 
     close_1 = float(c1["Close"])
@@ -269,9 +292,7 @@ def detect_signal(entry_df: pd.DataFrame, htf_df: pd.DataFrame):
     trend_up = ema20 > ema50 and close_1 > ema20
     trend_down = ema20 < ema50 and close_1 < ema20
 
-    # Fake breakdown then strong reclaim
     fake_breakdown = low_2 < recent_low and float(c2["Close"]) > recent_low
-    # Fake breakout then strong rejection
     fake_breakout = high_2 > recent_high and float(c2["Close"]) < recent_high
 
     buy_condition = (
@@ -362,7 +383,6 @@ def detect_signal(entry_df: pd.DataFrame, htf_df: pd.DataFrame):
 
     return None
 
-
 # =========================
 # MAIN LOOP
 # =========================
@@ -386,9 +406,12 @@ def main():
             entry_df = get_entry_data()
             htf_df = get_htf_data()
 
-            # Latest fully closed candle time
-            last_closed_candle_time = entry_df.iloc[-2].name
+            if entry_df is None or htf_df is None:
+                print("Data fetch failed, retrying later...")
+                time.sleep(120)
+                continue
 
+            last_closed_candle_time = entry_df.iloc[-2].name
             signal = detect_signal(entry_df, htf_df)
 
             if is_new_closed_candle(last_closed_candle_time, last_sent_candle_time):
@@ -413,6 +436,7 @@ def main():
 
         except Exception as e:
             print("Bot error:", e)
+            time.sleep(120)
 
         time.sleep(CHECK_EVERY_SECONDS)
 
